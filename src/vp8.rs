@@ -703,9 +703,9 @@ impl BoolReader {
         let split = 1 + (((self.range - 1) * u32::from(probability)) >> 8);
         let bigsplit = split << 8;
 
-        let retval = if self.value >= bigsplit {
+        let retval = if let Some(new_value) = self.value.checked_sub(bigsplit) {
             self.range -= split;
-            self.value -= bigsplit;
+            self.value = new_value;
             true
         } else {
             self.range = split;
@@ -723,9 +723,9 @@ impl BoolReader {
             self.range <<= shift;
             self.bit_count += shift as u8;
 
-            if self.bit_count >= 8 {
-                self.bit_count %= 8;
-
+            let should_read: bool = self.bit_count >= 8;
+            self.bit_count %= 8;
+            if should_read {
                 // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
                 // This match statement replicates that logic.
                 match self.reader.read_u8() {
@@ -768,10 +768,14 @@ impl BoolReader {
         probs: &[Prob],
         start: isize,
     ) -> Result<i8, DecodingError> {
+        assert_eq!(probs.len() * 2, tree.len());
+        assert!(start >= 0);
+        assert!((start as usize) + 1 < tree.len());
         let mut index = start;
 
         loop {
-            let a = self.read_bool(probs[index as usize >> 1])?;
+            let prob = probs[index as usize >> 1];
+            let a = self.read_bool(prob)?;
             let b = index + a as isize;
             index = tree[b as usize] as isize;
 
