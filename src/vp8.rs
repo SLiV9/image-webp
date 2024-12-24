@@ -669,11 +669,6 @@ static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15]
 
 struct BoolReader {
     reader: Cursor<Vec<u8>>,
-    state: BoolReaderState,
-}
-
-#[derive(Clone, Copy)]
-struct BoolReaderState {
     range: u32,
     value: u32,
     bit_count: u8,
@@ -684,12 +679,10 @@ impl BoolReader {
     pub(crate) fn new() -> BoolReader {
         BoolReader {
             reader: Default::default(),
-            state: BoolReaderState {
-                range: 0,
-                value: 0,
-                bit_count: 0,
-                eof: false,
-            },
+            range: 0,
+            value: 0,
+            bit_count: 0,
+            eof: false,
         }
     }
 
@@ -699,67 +692,51 @@ impl BoolReader {
         }
 
         self.reader = Cursor::new(buf);
-        let value = self.reader.read_u16::<BigEndian>()? as u32;
-        self.state = BoolReaderState {
-            value,
-            range: 255,
-            bit_count: 0,
-            eof: false,
-        };
+        self.value = self.reader.read_u16::<BigEndian>()? as u32;
+        self.range = 255;
+        self.bit_count = 0;
 
         Ok(())
     }
 
     pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
-        let (value, new_state) = Self::read_bool_fast(&mut self.reader, self.state, probability)?;
-        self.state = new_state;
-        Ok(value)
-    }
-
-    fn read_bool_fast(
-        reader: &mut Cursor<Vec<u8>>,
-        mut state: BoolReaderState,
-        probability: u8,
-    ) -> Result<(bool, BoolReaderState), DecodingError> {
-        let split = 1 + (((state.range - 1) * u32::from(probability)) >> 8);
+        let split = 1 + (((self.range - 1) * u32::from(probability)) >> 8);
         let bigsplit = split << 8;
 
-        let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
-            state.range -= split;
-            state.value = new_value;
+        let retval = if let Some(new_value) = self.value.checked_sub(bigsplit) {
+            self.range -= split;
+            self.value = new_value;
             true
         } else {
-            state.range = split;
+            self.range = split;
             false
         };
 
-        if state.range < 128 {
-            // Compute shift required to satisfy `state.range >= 128`.
-            // Apply that shift to `state.range`, `state.value`, and `state.bitcount`.
+        if self.range < 128 {
+            // Compute shift required to satisfy `self.range >= 128`.
+            // Apply that shift to `self.range`, `self.value`, and `self.bitcount`.
             //
             // Subtract 24 because we only care about leading zeros in the
-            // lowest byte of `state.range` which is a `u32`.
-            let shift = state.range.leading_zeros() - 24;
-            state.value <<= shift;
-            state.range <<= shift;
-            state.bit_count += shift as u8;
+            // lowest byte of `self.range` which is a `u32`.
+            let shift = self.range.leading_zeros() - 24;
+            self.value <<= shift;
+            self.range <<= shift;
+            self.bit_count += shift as u8;
 
-            let should_read: bool = state.bit_count >= 8;
-            state.bit_count %= 8;
+            let should_read: bool = self.bit_count >= 8;
+            self.bit_count %= 8;
             if should_read {
                 // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
                 // This match statement replicates that logic.
-                match reader.read_u8() {
-                    Ok(v) => state.value |= u32::from(v) << state.bit_count,
-                    Err(e) if e.kind() == ErrorKind::UnexpectedEof && !state.eof => {
-                        state.eof = true
-                    }
+                match self.reader.read_u8() {
+                    Ok(v) => self.value |= u32::from(v) << self.bit_count,
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof && !self.eof => self.eof = true,
                     Err(e) => return Err(DecodingError::IoError(e)),
                 };
             }
         }
 
-        Ok((retval, state))
+        Ok(retval)
     }
 
     pub(crate) fn read_literal(&mut self, n: u8) -> Result<u8, DecodingError> {
