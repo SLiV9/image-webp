@@ -673,25 +673,39 @@ struct BoolReader {
 }
 
 #[derive(Clone, Copy)]
-enum BoolReaderState {
-    Valid(ValidBoolReaderState),
-    EofReached,
-    ErrorReturned,
-    Uninitialized,
-}
-
-#[derive(Clone, Copy)]
-struct ValidBoolReaderState {
+struct BoolReaderState {
     range: u32,
     value: u32,
     bit_count: u8,
+    eof: bool,
+}
+
+impl BoolReaderState {
+    const UNINITIALIZED: Self = Self {
+        range: 0,
+        value: 0,
+        bit_count: 0,
+        eof: true,
+    };
+    const EOF: Self = Self {
+        range: 0,
+        value: 0,
+        bit_count: 0,
+        eof: true,
+    };
+    const ERROR: Self = Self {
+        range: 0,
+        value: 0,
+        bit_count: 0,
+        eof: true,
+    };
 }
 
 impl BoolReader {
     pub(crate) fn new() -> BoolReader {
         BoolReader {
             reader: Default::default(),
-            state: BoolReaderState::Uninitialized,
+            state: BoolReaderState::UNINITIALIZED,
         }
     }
 
@@ -704,26 +718,20 @@ impl BoolReader {
         let value = reader.read_u16::<BigEndian>()? as u32;
         *self = Self {
             reader,
-            state: BoolReaderState::Valid(ValidBoolReaderState {
+            state: BoolReaderState {
                 value,
                 range: 255,
                 bit_count: 0,
-            }),
+                eof: false,
+            },
         };
         Ok(())
     }
 
     pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
-        let mut state = match self.state {
-            BoolReaderState::Valid(state) => state,
-            BoolReaderState::EofReached => {
-                let error = self.recreate_eof_error();
-                self.state = BoolReaderState::ErrorReturned;
-                return Err(DecodingError::IoError(error));
-            }
-            BoolReaderState::ErrorReturned => unreachable!(),
-            BoolReaderState::Uninitialized => unreachable!(),
-        };
+        debug_assert!(!self.state.eof);
+        let mut state = self.state;
+
         let split = 1 + (((state.range - 1) * u32::from(probability)) >> 8);
         let bigsplit = split << 8;
 
@@ -736,63 +744,50 @@ impl BoolReader {
             false
         };
 
-        if state.range < 128 {
-            // Compute shift required to satisfy `state.range >= 128`.
-            // Apply that shift to `state.range`, `state.value`, and `state.bitcount`.
-            //
-            // Subtract 24 because we only care about leading zeros in the
-            // lowest byte of `state.range` which is a `u32`.
-            let shift = state.range.leading_zeros() - 24;
-            state.value <<= shift;
-            state.range <<= shift;
-            state.bit_count += shift as u8;
+        // Compute shift required to satisfy `state.range >= 128`.
+        // Apply that shift to `state.range`, `state.value`, and `state.bitcount`.
+        //
+        // Subtract 24 because we only care about leading zeros in the
+        // lowest byte of `state.range` which is a `u32`.
+        let shift = state.range.leading_zeros().saturating_sub(24);
+        state.value <<= shift;
+        state.range <<= shift;
+        state.bit_count += shift as u8;
+        debug_assert!(state.range >= 128);
 
-            let should_read: bool = state.bit_count >= 8;
-            state.bit_count %= 8;
-            if should_read {
-                // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
-                // This match statement replicates that logic.
-                let byte = match self.reader.read_u8() {
-                    Ok(v) => v,
-                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                        Self::peek_error(&e);
-                        self.state = BoolReaderState::EofReached;
-                        return Ok(retval);
-                    }
-                    Err(e) => {
-                        Self::peek_error(&e);
-                        self.state = BoolReaderState::ErrorReturned;
-                        return Err(DecodingError::IoError(e));
-                    }
-                };
-                state.value |= u32::from(byte) << state.bit_count;
-            }
+        let should_read: bool = state.bit_count >= 8;
+        state.bit_count %= 8;
+        if should_read {
+            // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
+            // This match statement replicates that logic.
+            let byte = match self.reader.read_u8() {
+                Ok(v) => v,
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                    Self::peek_error(&e);
+                    self.state = BoolReaderState::EOF;
+                    return Ok(retval);
+                }
+                Err(e) => {
+                    Self::peek_error(&e);
+                    self.state = BoolReaderState::ERROR;
+                    return Err(DecodingError::IoError(e));
+                }
+            };
+            state.value |= u32::from(byte) << state.bit_count;
         }
 
-        self.state = BoolReaderState::Valid(state);
+        self.state = state;
         Ok(retval)
     }
 
-    #[inline(never)]
     #[cold]
     fn peek_error(_error: &std::io::Error) {}
 
-    #[inline(never)]
-    #[cold]
-    fn recreate_eof_error(&mut self) -> std::io::Error {
-        match self.reader.read_u8() {
-            Ok(_) => unreachable!(),
-            Err(e) => e,
-        }
-    }
-
     pub(crate) fn read_literal(&mut self, n: u8) -> Result<u8, DecodingError> {
         let mut v = 0u8;
-        let mut n = n;
 
-        while n != 0 {
+        for _ in 0..n {
             v = (v << 1) + self.read_bool(128u8)? as u8;
-            n -= 1;
         }
 
         Ok(v)
