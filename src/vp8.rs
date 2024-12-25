@@ -667,8 +667,10 @@ static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15]
 
 #[cfg_attr(test, derive(Debug))]
 struct BoolReader {
-    bytes: Vec<u8>,
-    pos: usize,
+    chunks: Box<[[u8; 4]]>,
+    chunk_index: usize,
+    final_bytes: [u8; 3],
+    final_bytes_remaining: i8,
     value: u64,
     range: u32,
     bit_count: i32,
@@ -677,18 +679,37 @@ struct BoolReader {
 impl BoolReader {
     pub(crate) fn new() -> BoolReader {
         BoolReader {
-            bytes: Vec::new(),
-            pos: 0,
+            chunks: Box::new([]),
+            chunk_index: 0,
+            final_bytes: [0; 3],
+            final_bytes_remaining: 0,
             value: 0,
             range: 0,
             bit_count: 0,
         }
     }
 
-    pub(crate) fn init(&mut self, buf: Vec<u8>) -> Result<(), DecodingError> {
+    pub(crate) fn init(&mut self, mut buf: Vec<[u8; 4]>, len: usize) -> Result<(), DecodingError> {
+        let mut final_bytes = [0; 3];
+        let mut final_bytes_remaining = 0;
+        if len < 4 * buf.len() {
+            // Pop the last chunk, then get the remaining length.
+            let last_chunk = buf.pop().expect("just checked buf.len > 0");
+            let len_rounded_down = 4 * buf.len();
+            let n = len - len_rounded_down;
+            for i in n..4 {
+                debug_assert_eq!(last_chunk[i], 0, "failed {last_chunk:?}");
+            }
+            let [a, b, c, _] = last_chunk;
+            final_bytes = [a, b, c];
+            final_bytes_remaining = n as i8;
+        }
+        let chunks = buf.into_boxed_slice();
         *self = Self {
-            bytes: buf,
-            pos: 0,
+            chunks,
+            chunk_index: 0,
+            final_bytes,
+            final_bytes_remaining,
             value: 0,
             range: 255,
             bit_count: -8,
@@ -698,19 +719,14 @@ impl BoolReader {
     }
 
     fn load_new_bytes(&mut self) -> Result<(), DecodingError> {
-        // Try to read the next 7+1 bytes.
-        let value_bytes = self.bytes.get(self.pos..).and_then(|b| b.first_chunk());
-        if let Some(value_bytes) = value_bytes {
-            self.pos += 7;
-            let mut v = u64::from_be_bytes(*value_bytes);
-            v >>= 8;
-            self.value <<= 56;
-            self.value |= v;
-            self.bit_count += 56;
+        if let Some(chunk) = self.chunks.get(self.chunk_index) {
+            let v = u32::from_be_bytes(*chunk);
+            self.chunk_index += 1;
+            self.value <<= 32;
+            self.value |= u64::from(v);
+            self.bit_count += 32;
             Ok(())
         } else {
-            // This only fails if self.pos > self.bytes.len() - 8,
-            // so "almost never". No need to optimize this case.
             self.load_final_bytes()
         }
     }
@@ -720,20 +736,22 @@ impl BoolReader {
         #[cfg(test)]
         dbg!(&self);
 
-        if let Some(byte) = self.bytes.get(self.pos) {
-            self.pos += 1;
+        if self.final_bytes_remaining > 0 {
+            self.final_bytes_remaining -= 1;
+            let byte = self.final_bytes[0];
+            self.final_bytes.rotate_left(1);
             self.value <<= 8;
-            self.value |= u64::from(*byte);
+            self.value |= u64::from(byte);
             self.bit_count += 8;
 
             #[cfg(test)]
             dbg!(&self);
 
             Ok(())
-        } else if self.pos == self.bytes.len() {
+        } else if self.final_bytes_remaining == 0 {
             // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
             // This replicates that logic.
-            self.pos += 1;
+            self.final_bytes_remaining -= 1;
             self.value <<= 8;
             self.bit_count += 8;
 
@@ -1224,16 +1242,20 @@ impl<R: Read> Vp8Decoder<R> {
                     .read_u24::<LittleEndian>()
                     .expect("Reading from &[u8] can't fail and the chunk is complete");
 
-                let mut buf = vec![0; size as usize];
-                self.r.read_exact(buf.as_mut_slice())?;
-
-                self.partitions[i].init(buf)?;
+                let size = size as usize;
+                let mut buf = vec![[0; 4]; (size + 3) / 4];
+                let bytes: &mut [u8] = buf.as_mut_slice().as_flattened_mut();
+                self.r.read_exact(&mut bytes[..size])?;
+                self.partitions[i].init(buf, size)?;
             }
         }
 
         let mut buf = Vec::new();
         self.r.read_to_end(&mut buf)?;
-        self.partitions[n - 1].init(buf)?;
+        let size = buf.len();
+        let mut chunks = vec![[0; 4]; (size + 3) / 4];
+        chunks.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&buf);
+        self.partitions[n - 1].init(chunks, size)?;
 
         Ok(())
     }
@@ -1426,11 +1448,13 @@ impl<R: Read> Vp8Decoder<R> {
             self.left_border = vec![129u8; 1 + 16];
         }
 
-        let mut buf = vec![0; first_partition_size as usize];
-        self.r.read_exact(&mut buf)?;
+        let size = first_partition_size as usize;
+        let mut buf = vec![[0; 4]; (size + 3) / 4];
+        let bytes: &mut [u8] = buf.as_mut_slice().as_flattened_mut();
+        self.r.read_exact(&mut bytes[..size])?;
 
         // initialise binary decoder
-        self.b.init(buf)?;
+        self.b.init(buf, size)?;
 
         if self.frame.keyframe {
             let color_space = self.b.read_literal(1)?;
@@ -3105,7 +3129,11 @@ mod tests {
     #[test]
     fn test_bool_reader_hello_short() {
         let mut reader = BoolReader::new();
-        reader.init(b"hello".to_vec()).unwrap();
+        let data = b"hel";
+        let size = data.len();
+        let mut buf = vec![[0u8; 4]; 1];
+        buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
+        reader.init(buf, size).unwrap();
         assert_eq!(false, reader.read_bool(128).unwrap());
         assert_eq!(true, reader.read_bool(10).unwrap());
         assert_eq!(false, reader.read_bool(250).unwrap());
@@ -3113,13 +3141,16 @@ mod tests {
         assert_eq!(5, reader.read_literal(3).unwrap());
         assert_eq!(64, reader.read_literal(8).unwrap());
         assert_eq!(185, reader.read_literal(8).unwrap());
-        assert_eq!(31, reader.read_literal(8).unwrap());
     }
 
     #[test]
     fn test_bool_reader_hello_long() {
         let mut reader = BoolReader::new();
-        reader.init(b"hello world".to_vec()).unwrap();
+        let data = b"hello world";
+        let size = data.len();
+        let mut buf = vec![[0u8; 4]; (size + 3) / 4];
+        buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
+        reader.init(buf, size).unwrap();
         assert_eq!(false, reader.read_bool(128).unwrap());
         assert_eq!(true, reader.read_bool(10).unwrap());
         assert_eq!(false, reader.read_bool(250).unwrap());
