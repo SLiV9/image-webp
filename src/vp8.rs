@@ -12,12 +12,10 @@
 //!   of the VP8 format
 //!
 
-use byteorder_lite::BigEndian;
 use byteorder_lite::{LittleEndian, ReadBytesExt};
 use std::cmp;
 use std::default::Default;
 use std::io::Read;
-use std::io::{Cursor, ErrorKind};
 
 use crate::decoder::DecodingError;
 
@@ -668,120 +666,101 @@ static AC_QUANT: [i16; 128] = [
 static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
 struct BoolReader {
-    reader: Cursor<Vec<u8>>,
-    state: BoolReaderState,
-}
-
-#[derive(Clone, Copy)]
-struct BoolReaderState {
+    bytes: Vec<u8>,
+    pos: usize,
+    value: u64,
     range: u32,
-    value: u32,
-    bit_count: u8,
-    eof: bool,
-}
-
-impl BoolReaderState {
-    const UNINITIALIZED: Self = Self {
-        range: 0,
-        value: 0,
-        bit_count: 0,
-        eof: true,
-    };
-    const EOF: Self = Self {
-        range: 0,
-        value: 0,
-        bit_count: 0,
-        eof: true,
-    };
-    const ERROR: Self = Self {
-        range: 0,
-        value: 0,
-        bit_count: 0,
-        eof: true,
-    };
+    bit_count: i32,
 }
 
 impl BoolReader {
+    const NUM_BYTES_READ_AT_A_TIME: usize = 7;
+    const NUM_BITS_READ_AT_A_TIME: usize = 8 * Self::NUM_BYTES_READ_AT_A_TIME;
+
     pub(crate) fn new() -> BoolReader {
         BoolReader {
-            reader: Default::default(),
-            state: BoolReaderState::UNINITIALIZED,
+            bytes: Vec::new(),
+            pos: 0,
+            value: 0,
+            range: 0,
+            bit_count: 0,
         }
     }
 
     pub(crate) fn init(&mut self, buf: Vec<u8>) -> Result<(), DecodingError> {
-        if buf.len() < 2 {
-            return Err(DecodingError::NotEnoughInitData);
-        }
-
-        let mut reader = Cursor::new(buf);
-        let value = reader.read_u16::<BigEndian>()? as u32;
         *self = Self {
-            reader,
-            state: BoolReaderState {
-                value,
-                range: 255,
-                bit_count: 0,
-                eof: false,
-            },
+            bytes: buf,
+            pos: 0,
+            value: 0,
+            range: 255,
+            bit_count: -8,
         };
-        Ok(())
+        self.load_new_bytes()
+            .map_err(|_| DecodingError::NotEnoughInitData)
     }
 
-    pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
-        debug_assert!(!self.state.eof);
-        let mut state = self.state;
-
-        let split = 1 + (((state.range - 1) * u32::from(probability)) >> 8);
-        let bigsplit = split << 8;
-
-        let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
-            state.range -= split;
-            state.value = new_value;
-            true
+    fn load_new_bytes(&mut self) -> Result<(), DecodingError> {
+        let value_bytes = self.bytes.get(self.pos..).and_then(|b| b.first_chunk());
+        if let Some(value_bytes) = value_bytes {
+            self.pos += Self::NUM_BYTES_READ_AT_A_TIME;
+            let mut v = u64::from_be_bytes(*value_bytes);
+            v >>= 64 - Self::NUM_BITS_READ_AT_A_TIME;
+            self.value <<= Self::NUM_BITS_READ_AT_A_TIME;
+            self.value |= v;
+            Ok(())
         } else {
-            state.range = split;
-            false
-        };
-
-        // Compute shift required to satisfy `state.range >= 128`.
-        // Apply that shift to `state.range`, `state.value`, and `state.bitcount`.
-        //
-        // Subtract 24 because we only care about leading zeros in the
-        // lowest byte of `state.range` which is a `u32`.
-        let shift = state.range.leading_zeros().saturating_sub(24);
-        state.value <<= shift;
-        state.range <<= shift;
-        state.bit_count += shift as u8;
-        debug_assert!(state.range >= 128);
-
-        let should_read: bool = state.bit_count >= 8;
-        state.bit_count %= 8;
-        if should_read {
-            // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
-            // This match statement replicates that logic.
-            let byte = match self.reader.read_u8() {
-                Ok(v) => v,
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                    Self::peek_error(&e);
-                    self.state = BoolReaderState::EOF;
-                    return Ok(retval);
-                }
-                Err(e) => {
-                    Self::peek_error(&e);
-                    self.state = BoolReaderState::ERROR;
-                    return Err(DecodingError::IoError(e));
-                }
-            };
-            state.value |= u32::from(byte) << state.bit_count;
+            self.load_final_bytes()
         }
-
-        self.state = state;
-        Ok(retval)
     }
 
     #[cold]
-    fn peek_error(_error: &std::io::Error) {}
+    fn load_final_bytes(&mut self) -> Result<(), DecodingError> {
+        if let Some(byte) = self.bytes.get(self.pos) {
+            self.pos += 1;
+            self.value <<= 8;
+            self.value |= u64::from(*byte);
+            self.bit_count += 8;
+            Ok(())
+        } else if self.pos == self.bytes.len() {
+            // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
+            // This replicates that logic.
+            self.pos += 1;
+            self.value <<= 8;
+            self.bit_count += 8;
+            Ok(())
+        } else {
+            Err(DecodingError::NotEnoughData)
+        }
+    }
+
+    pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
+        if self.bit_count < 0 {
+            self.load_new_bytes()?;
+        }
+
+        let split = 1 + (((self.range - 1) * u32::from(probability)) >> 8);
+        let bigsplit = u64::from(split) << 8;
+
+        let retval = if let Some(new_value) = self.value.checked_sub(bigsplit) {
+            self.range -= split;
+            self.value = new_value;
+            true
+        } else {
+            self.range = split;
+            false
+        };
+
+        // Compute shift required to satisfy `self.range >= 128`.
+        // Apply that shift to `self.range`, `self.value`, and `self.bitcount`.
+        //
+        // Subtract 24 because we only care about leading zeros in the
+        // lowest byte of `self.range` which is a `u32`.
+        let shift = self.range.leading_zeros().saturating_sub(24) & 0x7;
+        self.range <<= shift;
+        self.bit_count -= shift as i32;
+        debug_assert!(self.range >= 128);
+        Ok(retval)
+    }
 
     pub(crate) fn read_literal(&mut self, n: u8) -> Result<u8, DecodingError> {
         let mut v = 0u8;
@@ -2862,6 +2841,11 @@ mod benches {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_num_bytes_read_at_a_time() {
+        assert!(BoolReader::NUM_BYTES_READ_AT_A_TIME < std::mem::size_of::<u64>());
+    }
 
     #[test]
     fn test_avg2() {

@@ -115,6 +115,11 @@ quick_error! {
             display("Not enough VP8 init data")
         }
 
+        /// VP8 Decoder wasn't provided with enough data
+        NotEnoughData {
+            display("Not enough VP8 data")
+        }
+
         /// At time of writing, only the YUV colour-space encoded as `0` is specified
         ColorSpaceInvalid(err: u8) {
             display("Invalid VP8 color space: {err}")
