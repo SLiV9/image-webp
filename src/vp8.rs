@@ -669,11 +669,11 @@ static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15]
 struct BoolReader {
     chunks: Box<[[u8; 4]]>,
     chunk_index: usize,
-    final_bytes: [u8; 3],
-    final_bytes_remaining: i8,
     value: u64,
     range: u32,
     bit_count: i32,
+    final_bytes: [u8; 4],
+    final_bytes_remaining: i32,
 }
 
 impl BoolReader {
@@ -681,61 +681,41 @@ impl BoolReader {
         BoolReader {
             chunks: Box::new([]),
             chunk_index: 0,
-            final_bytes: [0; 3],
-            final_bytes_remaining: 0,
             value: 0,
             range: 0,
             bit_count: 0,
+            final_bytes: [0; 4],
+            final_bytes_remaining: 0,
         }
     }
 
     pub(crate) fn init(&mut self, mut buf: Vec<[u8; 4]>, len: usize) -> Result<(), DecodingError> {
-        let mut final_bytes = [0; 3];
-        let mut final_bytes_remaining = 0;
-        if len < 4 * buf.len() {
-            // Pop the last chunk, then get the remaining length.
-            let last_chunk = buf.pop().expect("just checked buf.len > 0");
-            let len_rounded_down = 4 * buf.len();
-            let n = len - len_rounded_down;
-            for i in n..4 {
-                debug_assert_eq!(last_chunk[i], 0, "failed {last_chunk:?}");
-            }
-            let [a, b, c, _] = last_chunk;
-            final_bytes = [a, b, c];
-            final_bytes_remaining = n as i8;
+        // Pop the last chunk (which may be partial), then get length.
+        let Some(last_chunk) = buf.pop() else {
+            return Err(DecodingError::NotEnoughInitData);
+        };
+        let len_rounded_down = 4 * buf.len();
+        let num_bytes_popped = len - len_rounded_down;
+        debug_assert!(num_bytes_popped <= 4);
+        for i in num_bytes_popped..4 {
+            debug_assert_eq!(last_chunk[i], 0, "unexpected {last_chunk:?}");
         }
+
         let chunks = buf.into_boxed_slice();
         *self = Self {
             chunks,
             chunk_index: 0,
-            final_bytes,
-            final_bytes_remaining,
             value: 0,
             range: 255,
             bit_count: -8,
+            final_bytes: last_chunk,
+            final_bytes_remaining: num_bytes_popped as i32,
         };
-        self.load_new_bytes()
-            .map_err(|_| DecodingError::NotEnoughInitData)
-    }
-
-    fn load_new_bytes(&mut self) -> Result<(), DecodingError> {
-        if let Some(chunk) = self.chunks.get(self.chunk_index) {
-            let v = u32::from_be_bytes(*chunk);
-            self.chunk_index += 1;
-            self.value <<= 32;
-            self.value |= u64::from(v);
-            self.bit_count += 32;
-            Ok(())
-        } else {
-            self.load_final_bytes()
-        }
+        Ok(())
     }
 
     #[cold]
     fn load_final_bytes(&mut self) -> Result<(), DecodingError> {
-        #[cfg(test)]
-        dbg!(&self);
-
         if self.final_bytes_remaining > 0 {
             self.final_bytes_remaining -= 1;
             let byte = self.final_bytes[0];
@@ -743,10 +723,6 @@ impl BoolReader {
             self.value <<= 8;
             self.value |= u64::from(byte);
             self.bit_count += 8;
-
-            #[cfg(test)]
-            dbg!(&self);
-
             Ok(())
         } else if self.final_bytes_remaining == 0 {
             // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
@@ -754,33 +730,22 @@ impl BoolReader {
             self.final_bytes_remaining -= 1;
             self.value <<= 8;
             self.bit_count += 8;
-
-            #[cfg(test)]
-            dbg!(&self);
-
             Ok(())
         } else {
             Err(DecodingError::NotEnoughData)
         }
     }
 
-    pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
-        #[cfg(test)]
-        dbg!("START", probability);
-
+    #[cold]
+    #[inline(never)]
+    fn cold_read_bool_from_final_bytes(&mut self, probability: u32) -> Result<bool, DecodingError> {
         if self.bit_count < 0 {
-            self.load_new_bytes()?;
+            self.load_final_bytes()?;
         }
         debug_assert!(self.bit_count >= 0);
 
-        #[cfg(test)]
-        dbg!(&self);
-
-        let split = 1 + (((self.range - 1) * u32::from(probability)) >> 8);
+        let split = 1 + (((self.range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << self.bit_count;
-
-        #[cfg(test)]
-        dbg!(split, bigsplit);
 
         let retval = if let Some(new_value) = self.value.checked_sub(bigsplit) {
             self.range -= split;
@@ -792,9 +757,6 @@ impl BoolReader {
         };
         debug_assert!(self.range > 0);
 
-        #[cfg(test)]
-        dbg!(&self);
-
         // Compute shift required to satisfy `self.range >= 128`.
         // Apply that shift to `self.range` and `self.bitcount`.
         //
@@ -805,9 +767,54 @@ impl BoolReader {
         self.bit_count -= shift as i32;
         debug_assert!(self.range >= 128);
 
-        #[cfg(test)]
-        dbg!(&self);
+        Ok(retval)
+    }
 
+    pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
+        let probability = u32::from(probability);
+        let mut value: u64 = self.value;
+        let mut range: u32 = self.range;
+        let mut bit_count: i32 = self.bit_count;
+
+        let Some(chunk) = self.chunks.get(self.chunk_index).copied() else {
+            return self.cold_read_bool_from_final_bytes(probability);
+        };
+
+        if self.bit_count < 0 {
+            let v = u32::from_be_bytes(chunk);
+            self.chunk_index += 1;
+            value <<= 32;
+            value |= u64::from(v);
+            bit_count += 32;
+        }
+        debug_assert!(bit_count >= 0);
+
+        let split = 1 + (((range - 1) * probability) >> 8);
+        let bigsplit = u64::from(split) << bit_count;
+
+        let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
+            range -= split;
+            value = new_value;
+            true
+        } else {
+            range = split;
+            false
+        };
+        debug_assert!(range > 0);
+
+        // Compute shift required to satisfy `range >= 128`.
+        // Apply that shift to `range` and `self.bitcount`.
+        //
+        // Subtract 24 because we only care about leading zeros in the
+        // lowest byte of `range` which is a `u32`.
+        let shift = range.leading_zeros().saturating_sub(24);
+        range <<= shift;
+        bit_count -= shift as i32;
+        debug_assert!(range >= 128);
+
+        self.value = value;
+        self.range = range;
+        self.bit_count = bit_count;
         Ok(retval)
     }
 
