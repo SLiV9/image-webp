@@ -115,7 +115,7 @@ static KEYFRAME_BPRED_MODE_TREE: [i8; 18] = [
 ];
 
 // Probabilities for the BPRED_MODE_TREE
-static KEYFRAME_BPRED_MODE_PROBS: [[[u8; 9]; 10]; 10] = [
+static KEYFRAME_BPRED_MODE_PROBS: [[[Prob; 9]; 10]; 10] = [
     [
         [231, 120, 48, 89, 115, 113, 120, 152, 112],
         [152, 179, 64, 126, 170, 118, 46, 70, 95],
@@ -770,8 +770,7 @@ impl BoolReader {
         Ok(retval)
     }
 
-    pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
-        let probability = u32::from(probability);
+    pub(crate) fn read_bool(&mut self, probability: u32) -> Result<bool, DecodingError> {
         let mut value: u64 = self.value;
         let mut range: u32 = self.range;
         let mut bit_count: i32 = self.bit_count;
@@ -822,7 +821,7 @@ impl BoolReader {
         let mut v = 0u8;
 
         for _ in 0..n {
-            v = (v << 1) + self.read_bool(128u8)? as u8;
+            v = (v << 1) + self.read_bool(128)? as u8;
         }
 
         Ok(v)
@@ -852,6 +851,7 @@ impl BoolReader {
 
         loop {
             let prob = probs[index as usize >> 1];
+            let prob = u32::from(prob);
             let a = self.read_bool(prob)?;
             let b = index + a as isize;
             index = tree[b as usize] as isize;
@@ -1227,7 +1227,8 @@ impl<R: Read> Vp8Decoder<R> {
             for (j, js) in is.iter().enumerate() {
                 for (k, ks) in js.iter().enumerate() {
                     for (t, prob) in ks.iter().enumerate().take(NUM_DCT_TOKENS - 1) {
-                        if self.b.read_bool(*prob)? {
+                        let prob = u32::from(*prob);
+                        if self.b.read_bool(prob)? {
                             let v = self.b.read_literal(8)?;
                             self.token_probs[i][j][k][t] = v;
                         }
@@ -1538,13 +1539,14 @@ impl<R: Read> Vp8Decoder<R> {
         };
 
         mb.coeffs_skipped = if self.prob_skip_false.is_some() {
-            self.b.read_bool(*self.prob_skip_false.as_ref().unwrap())?
+            let prob = *self.prob_skip_false.as_ref().unwrap();
+            self.b.read_bool(u32::from(prob))?
         } else {
             false
         };
 
         let inter_predicted = if !self.frame.keyframe {
-            self.b.read_bool(self.prob_intra)?
+            self.b.read_bool(u32::from(self.prob_intra))?
         } else {
             false
         };
@@ -1817,7 +1819,8 @@ impl<R: Read> Vp8Decoder<R> {
                         if t == 0 {
                             break;
                         }
-                        extra = extra + extra + reader.read_bool(t)? as i16;
+                        let b = reader.read_bool(u32::from(t))?;
+                        extra = extra + extra + b as i16;
                     }
 
                     i16::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]) + extra
