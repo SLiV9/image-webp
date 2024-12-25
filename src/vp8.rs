@@ -665,6 +665,22 @@ static AC_QUANT: [i16; 128] = [
 
 static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NotEnoughData;
+
+impl NotEnoughData {
+    fn accumulate(
+        acc: &mut Result<(), NotEnoughData>,
+        result: Result<bool, NotEnoughData>,
+    ) -> bool {
+        *acc = acc.and(result.map(|_| ()));
+        match result {
+            Ok(b) => b,
+            Err(NotEnoughData) => false,
+        }
+    }
+}
+
 #[cfg_attr(test, derive(Debug))]
 struct BoolReader {
     chunks: Box<[[u8; 4]]>,
@@ -715,7 +731,7 @@ impl BoolReader {
     }
 
     #[cold]
-    fn load_final_bytes(&mut self) -> Result<(), DecodingError> {
+    fn load_final_bytes(&mut self) -> Result<(), NotEnoughData> {
         if self.final_bytes_remaining > 0 {
             self.final_bytes_remaining -= 1;
             let byte = self.final_bytes[0];
@@ -732,13 +748,13 @@ impl BoolReader {
             self.bit_count += 8;
             Ok(())
         } else {
-            Err(DecodingError::NotEnoughData)
+            Err(NotEnoughData)
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn cold_read_bool_from_final_bytes(&mut self, probability: u32) -> Result<bool, DecodingError> {
+    fn cold_read_bit_from_final_bytes(&mut self, probability: u32) -> Result<bool, NotEnoughData> {
         if self.bit_count < 0 {
             self.load_final_bytes()?;
         }
@@ -770,13 +786,13 @@ impl BoolReader {
         Ok(retval)
     }
 
-    pub(crate) fn read_bool(&mut self, probability: u32) -> Result<bool, DecodingError> {
+    fn read_bit(&mut self, probability: u32) -> Result<bool, NotEnoughData> {
         let mut value: u64 = self.value;
         let mut range: u32 = self.range;
         let mut bit_count: i32 = self.bit_count;
 
         let Some(chunk) = self.chunks.get(self.chunk_index).copied() else {
-            return self.cold_read_bool_from_final_bytes(probability);
+            return self.cold_read_bit_from_final_bytes(probability);
         };
 
         if self.bit_count < 0 {
@@ -819,11 +835,15 @@ impl BoolReader {
 
     pub(crate) fn read_literal(&mut self, n: u8) -> Result<u8, DecodingError> {
         let mut v = 0u8;
+        let mut res: Result<(), NotEnoughData> = Ok(());
 
         for _ in 0..n {
-            v = (v << 1) + self.read_bool(128)? as u8;
+            let b = self.read_bit(128);
+            let b = NotEnoughData::accumulate(&mut res, b);
+            v = (v << 1) + b as u8;
         }
 
+        res?;
         Ok(v)
     }
 
@@ -847,11 +867,13 @@ impl BoolReader {
         assert_eq!(probs.len() * 2, tree.len());
         assert!(start + 1 < tree.len());
         let mut index = start;
+        let mut res: Result<(), NotEnoughData> = Ok(());
 
         loop {
             let prob = probs[index as usize >> 1];
             let prob = u32::from(prob);
-            let b = self.read_bool(prob)?;
+            let b = self.read_bit(prob);
+            let b = NotEnoughData::accumulate(&mut res, b);
             if b {
                 index += 1;
             }
@@ -859,13 +881,22 @@ impl BoolReader {
             if t > 0 {
                 index = t as usize;
             } else {
+                res?;
                 return Ok(-t);
             }
         }
     }
 
     pub(crate) fn read_flag(&mut self) -> Result<bool, DecodingError> {
-        Ok(0 != self.read_literal(1)?)
+        self.read_flag_with_probability(128)
+    }
+
+    pub(crate) fn read_flag_with_probability(
+        &mut self,
+        probability: u8,
+    ) -> Result<bool, DecodingError> {
+        let b = self.read_bit(u32::from(probability))?;
+        Ok(b)
     }
 }
 
@@ -1227,8 +1258,7 @@ impl<R: Read> Vp8Decoder<R> {
             for (j, js) in is.iter().enumerate() {
                 for (k, ks) in js.iter().enumerate() {
                     for (t, prob) in ks.iter().enumerate().take(NUM_DCT_TOKENS - 1) {
-                        let prob = u32::from(*prob);
-                        if self.b.read_bool(prob)? {
+                        if self.b.read_flag_with_probability(*prob)? {
                             let v = self.b.read_literal(8)?;
                             self.token_probs[i][j][k][t] = v;
                         }
@@ -1540,13 +1570,13 @@ impl<R: Read> Vp8Decoder<R> {
 
         mb.coeffs_skipped = if self.prob_skip_false.is_some() {
             let prob = *self.prob_skip_false.as_ref().unwrap();
-            self.b.read_bool(u32::from(prob))?
+            self.b.read_flag_with_probability(prob)?
         } else {
             false
         };
 
         let inter_predicted = if !self.frame.keyframe {
-            self.b.read_bool(u32::from(self.prob_intra))?
+            self.b.read_flag_with_probability(self.prob_intra)?
         } else {
             false
         };
@@ -1819,7 +1849,7 @@ impl<R: Read> Vp8Decoder<R> {
                         if t == 0 {
                             break;
                         }
-                        let b = reader.read_bool(u32::from(t))?;
+                        let b = reader.read_flag_with_probability(t)?;
                         extra = extra + extra + b as i16;
                     }
 
@@ -1839,7 +1869,7 @@ impl<R: Read> Vp8Decoder<R> {
                 2
             };
 
-            if reader.read_bool(128)? {
+            if reader.read_flag()? {
                 abs_value = -abs_value;
             }
 
@@ -3144,9 +3174,9 @@ mod tests {
         let mut buf = vec![[0u8; 4]; 1];
         buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
         reader.init(buf, size).unwrap();
-        assert_eq!(false, reader.read_bool(128).unwrap());
-        assert_eq!(true, reader.read_bool(10).unwrap());
-        assert_eq!(false, reader.read_bool(250).unwrap());
+        assert_eq!(false, reader.read_flag_with_probability(128).unwrap());
+        assert_eq!(true, reader.read_flag_with_probability(10).unwrap());
+        assert_eq!(false, reader.read_flag_with_probability(250).unwrap());
         assert_eq!(1, reader.read_literal(1).unwrap());
         assert_eq!(5, reader.read_literal(3).unwrap());
         assert_eq!(64, reader.read_literal(8).unwrap());
@@ -3161,9 +3191,9 @@ mod tests {
         let mut buf = vec![[0u8; 4]; (size + 3) / 4];
         buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
         reader.init(buf, size).unwrap();
-        assert_eq!(false, reader.read_bool(128).unwrap());
-        assert_eq!(true, reader.read_bool(10).unwrap());
-        assert_eq!(false, reader.read_bool(250).unwrap());
+        assert_eq!(false, reader.read_flag_with_probability(128).unwrap());
+        assert_eq!(true, reader.read_flag_with_probability(10).unwrap());
+        assert_eq!(false, reader.read_flag_with_probability(250).unwrap());
         assert_eq!(1, reader.read_literal(1).unwrap());
         assert_eq!(5, reader.read_literal(3).unwrap());
         assert_eq!(64, reader.read_literal(8).unwrap());
