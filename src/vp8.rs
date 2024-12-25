@@ -842,26 +842,26 @@ impl BoolReader {
         &mut self,
         tree: &[i8],
         probs: &[Prob],
-        start: isize,
+        start: usize,
     ) -> Result<i8, DecodingError> {
         assert_eq!(probs.len() * 2, tree.len());
-        assert!(start >= 0);
-        assert!((start as usize) + 1 < tree.len());
+        assert!(start + 1 < tree.len());
         let mut index = start;
 
         loop {
             let prob = probs[index as usize >> 1];
             let prob = u32::from(prob);
-            let a = self.read_bool(prob)?;
-            let b = index + a as isize;
-            index = tree[b as usize] as isize;
-
-            if index <= 0 {
-                break;
+            let b = self.read_bool(prob)?;
+            if b {
+                index += 1;
+            }
+            let t = tree[index];
+            if t > 0 {
+                index = t as usize;
+            } else {
+                return Ok(-t);
             }
         }
-
-        Ok(-index as i8)
     }
 
     pub(crate) fn read_flag(&mut self) -> Result<bool, DecodingError> {
