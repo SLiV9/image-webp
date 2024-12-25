@@ -665,6 +665,7 @@ static AC_QUANT: [i16; 128] = [
 
 static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
+#[cfg_attr(test, derive(Debug))]
 struct BoolReader {
     bytes: Vec<u8>,
     pos: usize,
@@ -674,9 +675,6 @@ struct BoolReader {
 }
 
 impl BoolReader {
-    const NUM_BYTES_READ_AT_A_TIME: usize = 7;
-    const NUM_BITS_READ_AT_A_TIME: usize = 8 * Self::NUM_BYTES_READ_AT_A_TIME;
-
     pub(crate) fn new() -> BoolReader {
         BoolReader {
             bytes: Vec::new(),
@@ -700,26 +698,37 @@ impl BoolReader {
     }
 
     fn load_new_bytes(&mut self) -> Result<(), DecodingError> {
+        // Try to read the next 7+1 bytes.
         let value_bytes = self.bytes.get(self.pos..).and_then(|b| b.first_chunk());
         if let Some(value_bytes) = value_bytes {
-            self.pos += Self::NUM_BYTES_READ_AT_A_TIME;
+            self.pos += 7;
             let mut v = u64::from_be_bytes(*value_bytes);
-            v >>= 64 - Self::NUM_BITS_READ_AT_A_TIME;
-            self.value <<= Self::NUM_BITS_READ_AT_A_TIME;
+            v >>= 8;
+            self.value <<= 56;
             self.value |= v;
+            self.bit_count += 56;
             Ok(())
         } else {
+            // This only fails if self.pos > self.bytes.len() - 8,
+            // so "almost never". No need to optimize this case.
             self.load_final_bytes()
         }
     }
 
     #[cold]
     fn load_final_bytes(&mut self) -> Result<(), DecodingError> {
+        #[cfg(test)]
+        dbg!(&self);
+
         if let Some(byte) = self.bytes.get(self.pos) {
             self.pos += 1;
             self.value <<= 8;
             self.value |= u64::from(*byte);
             self.bit_count += 8;
+
+            #[cfg(test)]
+            dbg!(&self);
+
             Ok(())
         } else if self.pos == self.bytes.len() {
             // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
@@ -727,6 +736,10 @@ impl BoolReader {
             self.pos += 1;
             self.value <<= 8;
             self.bit_count += 8;
+
+            #[cfg(test)]
+            dbg!(&self);
+
             Ok(())
         } else {
             Err(DecodingError::NotEnoughData)
@@ -734,12 +747,22 @@ impl BoolReader {
     }
 
     pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
+        #[cfg(test)]
+        dbg!("START", probability);
+
         if self.bit_count < 0 {
             self.load_new_bytes()?;
         }
+        debug_assert!(self.bit_count >= 0);
+
+        #[cfg(test)]
+        dbg!(&self);
 
         let split = 1 + (((self.range - 1) * u32::from(probability)) >> 8);
-        let bigsplit = u64::from(split) << 8;
+        let bigsplit = u64::from(split) << self.bit_count;
+
+        #[cfg(test)]
+        dbg!(split, bigsplit);
 
         let retval = if let Some(new_value) = self.value.checked_sub(bigsplit) {
             self.range -= split;
@@ -749,16 +772,24 @@ impl BoolReader {
             self.range = split;
             false
         };
+        debug_assert!(self.range > 0);
+
+        #[cfg(test)]
+        dbg!(&self);
 
         // Compute shift required to satisfy `self.range >= 128`.
-        // Apply that shift to `self.range`, `self.value`, and `self.bitcount`.
+        // Apply that shift to `self.range` and `self.bitcount`.
         //
         // Subtract 24 because we only care about leading zeros in the
         // lowest byte of `self.range` which is a `u32`.
-        let shift = self.range.leading_zeros().saturating_sub(24) & 0x7;
+        let shift = self.range.leading_zeros().saturating_sub(24);
         self.range <<= shift;
         self.bit_count -= shift as i32;
         debug_assert!(self.range >= 128);
+
+        #[cfg(test)]
+        dbg!(&self);
+
         Ok(retval)
     }
 
@@ -2843,11 +2874,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_num_bytes_read_at_a_time() {
-        assert!(BoolReader::NUM_BYTES_READ_AT_A_TIME < std::mem::size_of::<u64>());
-    }
-
-    #[test]
     fn test_avg2() {
         for i in 0u8..=255 {
             for j in 0u8..=255 {
@@ -3074,5 +3100,33 @@ mod tests {
         assert_eq!(im[38], avg_2);
         assert_eq!(im[39], avg_3);
         assert_eq!(im[40], avg_4);
+    }
+
+    #[test]
+    fn test_bool_reader_hello_short() {
+        let mut reader = BoolReader::new();
+        reader.init(b"hello".to_vec()).unwrap();
+        assert_eq!(false, reader.read_bool(128).unwrap());
+        assert_eq!(true, reader.read_bool(10).unwrap());
+        assert_eq!(false, reader.read_bool(250).unwrap());
+        assert_eq!(1, reader.read_literal(1).unwrap());
+        assert_eq!(5, reader.read_literal(3).unwrap());
+        assert_eq!(64, reader.read_literal(8).unwrap());
+        assert_eq!(185, reader.read_literal(8).unwrap());
+        assert_eq!(31, reader.read_literal(8).unwrap());
+    }
+
+    #[test]
+    fn test_bool_reader_hello_long() {
+        let mut reader = BoolReader::new();
+        reader.init(b"hello world".to_vec()).unwrap();
+        assert_eq!(false, reader.read_bool(128).unwrap());
+        assert_eq!(true, reader.read_bool(10).unwrap());
+        assert_eq!(false, reader.read_bool(250).unwrap());
+        assert_eq!(1, reader.read_literal(1).unwrap());
+        assert_eq!(5, reader.read_literal(3).unwrap());
+        assert_eq!(64, reader.read_literal(8).unwrap());
+        assert_eq!(185, reader.read_literal(8).unwrap());
+        assert_eq!(31, reader.read_literal(8).unwrap());
     }
 }
