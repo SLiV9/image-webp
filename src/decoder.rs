@@ -9,7 +9,6 @@ use std::ops::Range;
 use crate::extended::{self, get_alpha_predictor, read_alpha_chunk, WebPExtendedInfo};
 
 use super::lossless::LosslessDecoder;
-use super::vp8::NotEnoughData;
 use super::vp8::Vp8Decoder;
 
 quick_error! {
@@ -114,12 +113,6 @@ quick_error! {
         /// VP8 Decoder initialisation wasn't provided with enough data
         NotEnoughInitData {
             display("Not enough VP8 init data")
-        }
-
-        /// VP8 Decoder wasn't provided with enough data
-        NotEnoughData(err: NotEnoughData) {
-            from()
-            display("Not enough VP8 data")
         }
 
         /// At time of writing, only the YUV colour-space encoded as `0` is specified

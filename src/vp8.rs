@@ -665,19 +665,65 @@ static AC_QUANT: [i16; 128] = [
 
 static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct NotEnoughData;
+#[derive(Clone, Copy)]
+struct BitResult<T: Copy> {
+    value_if_enough_data: T,
+    enough_data: bool,
+}
 
-impl NotEnoughData {
-    fn accumulate(
-        acc: &mut Result<(), NotEnoughData>,
-        result: Result<bool, NotEnoughData>,
-    ) -> bool {
-        *acc = acc.and(result.map(|_| ()));
-        match result {
-            Ok(b) => b,
-            Err(NotEnoughData) => false,
+impl BitResult<()> {
+    const OK: Self = Self::ok(());
+    const ERR: Self = Self::err(());
+}
+
+impl<T: Copy> BitResult<T> {
+    const fn ok(value: T) -> Self {
+        Self {
+            value_if_enough_data: value,
+            enough_data: true,
         }
+    }
+
+    const fn err(value: T) -> Self {
+        Self {
+            value_if_enough_data: value,
+            enough_data: false,
+        }
+    }
+
+    fn is_err(&self) -> bool {
+        !self.enough_data
+    }
+
+    fn or_accumulate(self, acc: &mut BitResult<()>) -> T {
+        acc.enough_data &= self.enough_data;
+        self.value_if_enough_data
+    }
+
+    fn then<S: Copy>(self, value: S) -> BitResult<S> {
+        BitResult {
+            value_if_enough_data: value,
+            enough_data: self.enough_data,
+        }
+    }
+
+    fn as_result(self) -> Result<T, DecodingError> {
+        if self.enough_data {
+            Ok(self.value_if_enough_data)
+        } else {
+            Err(DecodingError::BitStreamError)
+        }
+    }
+
+    #[cfg(test)]
+    fn unwrap(self) -> T {
+        self.as_result().unwrap()
+    }
+}
+
+impl<T: Copy> From<BitResult<T>> for Result<T, DecodingError> {
+    fn from(result: BitResult<T>) -> Result<T, DecodingError> {
+        result.as_result()
     }
 }
 
@@ -731,7 +777,7 @@ impl BoolReader {
     }
 
     #[cold]
-    fn load_final_bytes(&mut self) -> Result<(), NotEnoughData> {
+    fn load_final_bytes(&mut self) -> BitResult<()> {
         if self.final_bytes_remaining > 0 {
             self.final_bytes_remaining -= 1;
             let byte = self.final_bytes[0];
@@ -739,24 +785,26 @@ impl BoolReader {
             self.value <<= 8;
             self.value |= u64::from(byte);
             self.bit_count += 8;
-            Ok(())
+            BitResult::OK
         } else if self.final_bytes_remaining == 0 {
             // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
             // This replicates that logic.
             self.final_bytes_remaining -= 1;
             self.value <<= 8;
             self.bit_count += 8;
-            Ok(())
+            BitResult::OK
         } else {
-            Err(NotEnoughData)
+            BitResult::ERR
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn cold_read_bit_from_final_bytes(&mut self, probability: u32) -> Result<bool, NotEnoughData> {
+    fn cold_read_bit_from_final_bytes(&mut self, probability: u32) -> BitResult<bool> {
         if self.bit_count < 0 {
-            self.load_final_bytes()?;
+            if self.load_final_bytes().is_err() {
+                return BitResult::err(false);
+            }
         }
         debug_assert!(self.bit_count >= 0);
 
@@ -783,10 +831,10 @@ impl BoolReader {
         self.bit_count -= shift as i32;
         debug_assert!(self.range >= 128);
 
-        Ok(retval)
+        BitResult::ok(retval)
     }
 
-    fn read_bit(&mut self, probability: u32) -> Result<bool, NotEnoughData> {
+    fn read_bit(&mut self, probability: u32) -> BitResult<bool> {
         let mut value: u64 = self.value;
         let mut range: u32 = self.range;
         let mut bit_count: i32 = self.bit_count;
@@ -830,32 +878,36 @@ impl BoolReader {
         self.value = value;
         self.range = range;
         self.bit_count = bit_count;
-        Ok(retval)
+        BitResult::ok(retval)
     }
 
-    pub(crate) fn read_literal(&mut self, n: u8) -> Result<u8, DecodingError> {
+    pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
+        self.read_bit(u32::from(probability))
+    }
+
+    pub(crate) fn read_literal(&mut self, n: u8) -> BitResult<u8> {
         let mut v = 0u8;
-        let mut res: Result<(), NotEnoughData> = Ok(());
+        let mut res = BitResult::OK;
 
         for _ in 0..n {
-            let b = self.read_bit(128);
-            let b = NotEnoughData::accumulate(&mut res, b);
+            let b = self.read_bit(128).or_accumulate(&mut res);
             v = (v << 1) + b as u8;
         }
 
-        res?;
-        Ok(v)
+        res.then(v)
     }
 
-    pub(crate) fn read_magnitude_and_sign(&mut self, n: u8) -> Result<i32, DecodingError> {
-        let magnitude = self.read_literal(n)?;
-        let sign = self.read_literal(1)?;
+    pub(crate) fn read_magnitude_and_sign(&mut self, n: u8) -> BitResult<i32> {
+        let mut res = BitResult::OK;
+        let magnitude = self.read_literal(n).or_accumulate(&mut res);
+        let sign = self.read_flag().or_accumulate(&mut res);
 
-        if sign == 1 {
-            Ok(-i32::from(magnitude))
+        let value = if sign {
+            -i32::from(magnitude)
         } else {
-            Ok(i32::from(magnitude))
-        }
+            i32::from(magnitude)
+        };
+        res.then(value)
     }
 
     pub(crate) fn read_with_tree(
@@ -863,17 +915,16 @@ impl BoolReader {
         tree: &[i8],
         probs: &[Prob],
         start: usize,
-    ) -> Result<i8, DecodingError> {
+    ) -> BitResult<i8> {
         assert_eq!(probs.len() * 2, tree.len());
         assert!(start + 1 < tree.len());
         let mut index = start;
-        let mut res: Result<(), NotEnoughData> = Ok(());
+        let mut res = BitResult::OK;
 
         loop {
             let prob = probs[index as usize >> 1];
             let prob = u32::from(prob);
-            let b = self.read_bit(prob);
-            let b = NotEnoughData::accumulate(&mut res, b);
+            let b = self.read_bit(prob).or_accumulate(&mut res);
             if b {
                 index += 1;
             }
@@ -881,22 +932,13 @@ impl BoolReader {
             if t > 0 {
                 index = t as usize;
             } else {
-                res?;
-                return Ok(-t);
+                return res.then(-t);
             }
         }
     }
 
-    pub(crate) fn read_flag(&mut self) -> Result<bool, DecodingError> {
-        self.read_flag_with_probability(128)
-    }
-
-    pub(crate) fn read_flag_with_probability(
-        &mut self,
-        probability: u8,
-    ) -> Result<bool, DecodingError> {
-        let b = self.read_bit(u32::from(probability))?;
-        Ok(b)
+    pub(crate) fn read_flag(&mut self) -> BitResult<bool> {
+        self.read_bit(128)
     }
 }
 
@@ -1253,21 +1295,21 @@ impl<R: Read> Vp8Decoder<R> {
         }
     }
 
-    fn update_token_probabilities(&mut self) -> Result<(), DecodingError> {
+    fn update_token_probabilities(&mut self) -> BitResult<()> {
+        let mut res = BitResult::OK;
         for (i, is) in COEFF_UPDATE_PROBS.iter().enumerate() {
             for (j, js) in is.iter().enumerate() {
                 for (k, ks) in js.iter().enumerate() {
                     for (t, prob) in ks.iter().enumerate().take(NUM_DCT_TOKENS - 1) {
-                        if self.b.read_flag_with_probability(*prob)? {
-                            let v = self.b.read_literal(8)?;
+                        if self.b.read_bool(*prob).or_accumulate(&mut res) {
+                            let v = self.b.read_literal(8).or_accumulate(&mut res);
                             self.token_probs[i][j][k][t] = v;
                         }
                     }
                 }
             }
         }
-
-        Ok(())
+        res
     }
 
     fn init_partitions(&mut self, n: usize) -> Result<(), DecodingError> {
@@ -1298,7 +1340,7 @@ impl<R: Read> Vp8Decoder<R> {
         Ok(())
     }
 
-    fn read_quantization_indices(&mut self) -> Result<(), DecodingError> {
+    fn read_quantization_indices(&mut self) -> BitResult<()> {
         fn dc_quant(index: i32) -> i16 {
             DC_QUANT[index.clamp(0, 127) as usize]
         }
@@ -1307,33 +1349,35 @@ impl<R: Read> Vp8Decoder<R> {
             AC_QUANT[index.clamp(0, 127) as usize]
         }
 
-        let yac_abs = self.b.read_literal(7)?;
-        let ydc_delta = if self.b.read_flag()? {
-            self.b.read_magnitude_and_sign(4)?
+        let mut res = BitResult::OK;
+
+        let yac_abs = self.b.read_literal(7).or_accumulate(&mut res);
+        let ydc_delta = if self.b.read_flag().or_accumulate(&mut res) {
+            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
         } else {
             0
         };
 
-        let y2dc_delta = if self.b.read_flag()? {
-            self.b.read_magnitude_and_sign(4)?
+        let y2dc_delta = if self.b.read_flag().or_accumulate(&mut res) {
+            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
         } else {
             0
         };
 
-        let y2ac_delta = if self.b.read_flag()? {
-            self.b.read_magnitude_and_sign(4)?
+        let y2ac_delta = if self.b.read_flag().or_accumulate(&mut res) {
+            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
         } else {
             0
         };
 
-        let uvdc_delta = if self.b.read_flag()? {
-            self.b.read_magnitude_and_sign(4)?
+        let uvdc_delta = if self.b.read_flag().or_accumulate(&mut res) {
+            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
         } else {
             0
         };
 
-        let uvac_delta = if self.b.read_flag()? {
-            self.b.read_magnitude_and_sign(4)?
+        let uvac_delta = if self.b.read_flag().or_accumulate(&mut res) {
+            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
         } else {
             0
         };
@@ -1373,62 +1417,66 @@ impl<R: Read> Vp8Decoder<R> {
             }
         }
 
-        Ok(())
+        res
     }
 
-    fn read_loop_filter_adjustments(&mut self) -> Result<(), DecodingError> {
-        if self.b.read_flag()? {
+    fn read_loop_filter_adjustments(&mut self) -> BitResult<()> {
+        let mut res = BitResult::OK;
+
+        if self.b.read_flag().or_accumulate(&mut res) {
             for i in 0usize..4 {
-                let ref_frame_delta_update_flag = self.b.read_flag()?;
+                let ref_frame_delta_update_flag = self.b.read_flag().or_accumulate(&mut res);
 
                 self.ref_delta[i] = if ref_frame_delta_update_flag {
-                    self.b.read_magnitude_and_sign(6)?
+                    self.b.read_magnitude_and_sign(6).or_accumulate(&mut res)
                 } else {
                     0i32
                 };
             }
 
             for i in 0usize..4 {
-                let mb_mode_delta_update_flag = self.b.read_flag()?;
+                let mb_mode_delta_update_flag = self.b.read_flag().or_accumulate(&mut res);
 
                 self.mode_delta[i] = if mb_mode_delta_update_flag {
-                    self.b.read_magnitude_and_sign(6)?
+                    self.b.read_magnitude_and_sign(6).or_accumulate(&mut res)
                 } else {
                     0i32
                 };
             }
         }
 
-        Ok(())
+        res
     }
 
-    fn read_segment_updates(&mut self) -> Result<(), DecodingError> {
+    fn read_segment_updates(&mut self) -> BitResult<()> {
+        let mut res = BitResult::OK;
+
         // Section 9.3
-        self.segments_update_map = self.b.read_flag()?;
-        let update_segment_feature_data = self.b.read_flag()?;
+        self.segments_update_map = self.b.read_flag().or_accumulate(&mut res);
+        let update_segment_feature_data = self.b.read_flag().or_accumulate(&mut res);
 
         if update_segment_feature_data {
-            let segment_feature_mode = self.b.read_flag()?;
+            let segment_feature_mode = self.b.read_flag().or_accumulate(&mut res);
 
             for i in 0usize..MAX_SEGMENTS {
                 self.segment[i].delta_values = !segment_feature_mode;
             }
 
             for i in 0usize..MAX_SEGMENTS {
-                let update = self.b.read_flag()?;
+                let update = self.b.read_flag().or_accumulate(&mut res);
 
                 self.segment[i].quantizer_level = if update {
-                    self.b.read_magnitude_and_sign(7)?
+                    self.b.read_magnitude_and_sign(7).or_accumulate(&mut res)
                 } else {
                     0i32
                 } as i8;
             }
 
             for i in 0usize..MAX_SEGMENTS {
-                let update = self.b.read_flag()?;
+                let update = self.b.read_flag().or_accumulate(&mut res);
 
                 self.segment[i].loopfilter_level = if update {
-                    self.b.read_magnitude_and_sign(6)?
+                    self.b.read_magnitude_and_sign(6).or_accumulate(&mut res)
                 } else {
                     0i32
                 } as i8;
@@ -1437,13 +1485,17 @@ impl<R: Read> Vp8Decoder<R> {
 
         if self.segments_update_map {
             for i in 0usize..3 {
-                let update = self.b.read_flag()?;
+                let update = self.b.read_flag().or_accumulate(&mut res);
 
-                self.segment_tree_probs[i] = if update { self.b.read_literal(8)? } else { 255 };
+                self.segment_tree_probs[i] = if update {
+                    self.b.read_literal(8).or_accumulate(&mut res)
+                } else {
+                    255
+                };
             }
         }
 
-        Ok(())
+        res
     }
 
     fn read_frame_header(&mut self) -> Result<(), DecodingError> {
@@ -1494,34 +1546,37 @@ impl<R: Read> Vp8Decoder<R> {
         // initialise binary decoder
         self.b.init(buf, size)?;
 
+        let mut res = BitResult::OK;
         if self.frame.keyframe {
-            let color_space = self.b.read_literal(1)?;
-            self.frame.pixel_type = self.b.read_literal(1)?;
+            let color_space = self.b.read_literal(1).or_accumulate(&mut res);
+            self.frame.pixel_type = self.b.read_literal(1).or_accumulate(&mut res);
 
             if color_space != 0 {
                 return Err(DecodingError::ColorSpaceInvalid(color_space));
             }
         }
 
-        self.segments_enabled = self.b.read_flag()?;
+        self.segments_enabled = self.b.read_flag().or_accumulate(&mut res);
         if self.segments_enabled {
-            self.read_segment_updates()?;
+            self.read_segment_updates().or_accumulate(&mut res);
         }
 
-        self.frame.filter_type = self.b.read_flag()?;
-        self.frame.filter_level = self.b.read_literal(6)?;
-        self.frame.sharpness_level = self.b.read_literal(3)?;
+        self.frame.filter_type = self.b.read_flag().or_accumulate(&mut res);
+        self.frame.filter_level = self.b.read_literal(6).or_accumulate(&mut res);
+        self.frame.sharpness_level = self.b.read_literal(3).or_accumulate(&mut res);
 
-        let lf_adjust_enable = self.b.read_flag()?;
+        let lf_adjust_enable = self.b.read_flag().or_accumulate(&mut res);
         if lf_adjust_enable {
-            self.read_loop_filter_adjustments()?;
+            self.read_loop_filter_adjustments().or_accumulate(&mut res);
         }
 
-        self.num_partitions = (1usize << self.b.read_literal(2)? as usize) as u8;
-        let num_partitions = self.num_partitions as usize;
+        let num_partitions = 1 << self.b.read_literal(2).or_accumulate(&mut res) as usize;
+        res.as_result()?;
+
+        self.num_partitions = num_partitions as u8;
         self.init_partitions(num_partitions)?;
 
-        self.read_quantization_indices()?;
+        self.read_quantization_indices().as_result()?;
 
         if !self.frame.keyframe {
             // 9.7 refresh golden frame and altref frame
@@ -1534,14 +1589,16 @@ impl<R: Read> Vp8Decoder<R> {
             let _ = self.b.read_literal(1);
         }
 
-        self.update_token_probabilities()?;
+        let mut res = BitResult::OK;
+        self.update_token_probabilities().or_accumulate(&mut res);
 
-        let mb_no_skip_coeff = self.b.read_literal(1)?;
+        let mb_no_skip_coeff = self.b.read_literal(1).or_accumulate(&mut res);
         self.prob_skip_false = if mb_no_skip_coeff == 1 {
-            Some(self.b.read_literal(8)?)
+            Some(self.b.read_literal(8).or_accumulate(&mut res))
         } else {
             None
         };
+        res.as_result()?;
 
         if !self.frame.keyframe {
             // 9.10 remaining frame data
@@ -1564,19 +1621,18 @@ impl<R: Read> Vp8Decoder<R> {
         if self.segments_enabled && self.segments_update_map {
             mb.segmentid = self
                 .b
-                .read_with_tree(&SEGMENT_ID_TREE, &self.segment_tree_probs, 0)?
-                as u8;
+                .read_with_tree(&SEGMENT_ID_TREE, &self.segment_tree_probs, 0)
+                .as_result()? as u8;
         };
 
-        mb.coeffs_skipped = if self.prob_skip_false.is_some() {
-            let prob = *self.prob_skip_false.as_ref().unwrap();
-            self.b.read_flag_with_probability(prob)?
+        mb.coeffs_skipped = if let Some(prob) = self.prob_skip_false {
+            self.b.read_bool(prob).as_result()?
         } else {
             false
         };
 
         let inter_predicted = if !self.frame.keyframe {
-            self.b.read_flag_with_probability(self.prob_intra)?
+            self.b.read_bool(self.prob_intra).as_result()?
         } else {
             false
         };
@@ -1591,7 +1647,8 @@ impl<R: Read> Vp8Decoder<R> {
             // intra prediction
             let luma = self
                 .b
-                .read_with_tree(&KEYFRAME_YMODE_TREE, &KEYFRAME_YMODE_PROBS, 0)?;
+                .read_with_tree(&KEYFRAME_YMODE_TREE, &KEYFRAME_YMODE_PROBS, 0)
+                .as_result()?;
             mb.luma_mode =
                 LumaMode::from_i8(luma).ok_or(DecodingError::LumaPredictionModeInvalid(luma))?;
 
@@ -1602,11 +1659,14 @@ impl<R: Read> Vp8Decoder<R> {
                         for x in 0usize..4 {
                             let top = self.top[mbx].bpred[12 + x];
                             let left = self.left.bpred[y];
-                            let intra = self.b.read_with_tree(
-                                &KEYFRAME_BPRED_MODE_TREE,
-                                &KEYFRAME_BPRED_MODE_PROBS[top as usize][left as usize],
-                                0,
-                            )?;
+                            let intra = self
+                                .b
+                                .read_with_tree(
+                                    &KEYFRAME_BPRED_MODE_TREE,
+                                    &KEYFRAME_BPRED_MODE_PROBS[top as usize][left as usize],
+                                    0,
+                                )
+                                .as_result()?;
                             let bmode = IntraMode::from_i8(intra)
                                 .ok_or(DecodingError::IntraPredictionModeInvalid(intra))?;
                             mb.bpred[x + y * 4] = bmode;
@@ -1624,9 +1684,10 @@ impl<R: Read> Vp8Decoder<R> {
                 }
             }
 
-            let chroma =
-                self.b
-                    .read_with_tree(&KEYFRAME_UV_MODE_TREE, &KEYFRAME_UV_MODE_PROBS, 0)?;
+            let chroma = self
+                .b
+                .read_with_tree(&KEYFRAME_UV_MODE_TREE, &KEYFRAME_UV_MODE_PROBS, 0)
+                .as_result()?;
             mb.chroma_mode = ChromaMode::from_i8(chroma)
                 .ok_or(DecodingError::ChromaPredictionModeInvalid(chroma))?;
         }
@@ -1805,7 +1866,9 @@ impl<R: Read> Vp8Decoder<R> {
         complexity: usize,
         dcq: i16,
         acq: i16,
-    ) -> Result<bool, DecodingError> {
+    ) -> BitResult<bool> {
+        let mut res = BitResult::OK;
+
         // perform bounds checks once up front,
         // so that the compiler doesn't have to insert them in the hot loop below
         assert!(complexity <= 2);
@@ -1823,9 +1886,13 @@ impl<R: Read> Vp8Decoder<R> {
             let table = &probs[COEFF_BANDS[i] as usize][complexity];
 
             let token = if !skip {
-                reader.read_with_tree(tree, table, 0)?
+                reader
+                    .read_with_tree(tree, table, 0)
+                    .or_accumulate(&mut res)
             } else {
-                reader.read_with_tree(tree, table, 2)?
+                reader
+                    .read_with_tree(tree, table, 2)
+                    .or_accumulate(&mut res)
             };
 
             let mut abs_value = i32::from(match token {
@@ -1849,7 +1916,7 @@ impl<R: Read> Vp8Decoder<R> {
                         if t == 0 {
                             break;
                         }
-                        let b = reader.read_flag_with_probability(t)?;
+                        let b = reader.read_bool(t).or_accumulate(&mut res);
                         extra = extra + extra + b as i16;
                     }
 
@@ -1869,7 +1936,7 @@ impl<R: Read> Vp8Decoder<R> {
                 2
             };
 
-            if reader.read_flag()? {
+            if reader.read_flag().or_accumulate(&mut res) {
                 abs_value = -abs_value;
             }
 
@@ -1879,7 +1946,7 @@ impl<R: Read> Vp8Decoder<R> {
             has_coefficients = true;
         }
 
-        Ok(has_coefficients)
+        res.then(has_coefficients)
     }
 
     fn read_residual_data(
@@ -1897,7 +1964,8 @@ impl<R: Read> Vp8Decoder<R> {
             let mut block = [0i32; 16];
             let dcq = self.segment[sindex].y2dc;
             let acq = self.segment[sindex].y2ac;
-            let n = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
+            let n = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq);
+            let n = n.as_result()?;
 
             self.left.complexity[0] = if n { 1 } else { 0 };
             self.top[mbx].complexity[0] = if n { 1 } else { 0 };
@@ -1922,7 +1990,8 @@ impl<R: Read> Vp8Decoder<R> {
                 let dcq = self.segment[sindex].ydc;
                 let acq = self.segment[sindex].yac;
 
-                let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq);
+                let n = n.as_result()?;
 
                 if block[0] != 0 || n {
                     transform::idct4x4(block);
@@ -1950,8 +2019,8 @@ impl<R: Read> Vp8Decoder<R> {
                     let dcq = self.segment[sindex].uvdc;
                     let acq = self.segment[sindex].uvac;
 
-                    let n =
-                        self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                    let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq);
+                    let n = n.as_result()?;
                     if block[0] != 0 || n {
                         transform::idct4x4(block);
                     }
@@ -3174,9 +3243,9 @@ mod tests {
         let mut buf = vec![[0u8; 4]; 1];
         buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
         reader.init(buf, size).unwrap();
-        assert_eq!(false, reader.read_flag_with_probability(128).unwrap());
-        assert_eq!(true, reader.read_flag_with_probability(10).unwrap());
-        assert_eq!(false, reader.read_flag_with_probability(250).unwrap());
+        assert_eq!(false, reader.read_bool(128).unwrap());
+        assert_eq!(true, reader.read_bool(10).unwrap());
+        assert_eq!(false, reader.read_bool(250).unwrap());
         assert_eq!(1, reader.read_literal(1).unwrap());
         assert_eq!(5, reader.read_literal(3).unwrap());
         assert_eq!(64, reader.read_literal(8).unwrap());
@@ -3191,9 +3260,9 @@ mod tests {
         let mut buf = vec![[0u8; 4]; (size + 3) / 4];
         buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
         reader.init(buf, size).unwrap();
-        assert_eq!(false, reader.read_flag_with_probability(128).unwrap());
-        assert_eq!(true, reader.read_flag_with_probability(10).unwrap());
-        assert_eq!(false, reader.read_flag_with_probability(250).unwrap());
+        assert_eq!(false, reader.read_bool(128).unwrap());
+        assert_eq!(true, reader.read_bool(10).unwrap());
+        assert_eq!(false, reader.read_bool(250).unwrap());
         assert_eq!(1, reader.read_literal(1).unwrap());
         assert_eq!(5, reader.read_literal(3).unwrap());
         assert_eq!(64, reader.read_literal(8).unwrap());
