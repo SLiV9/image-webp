@@ -665,65 +665,47 @@ static AC_QUANT: [i16; 128] = [
 
 static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
-#[derive(Clone, Copy)]
-struct BitResult<T: Copy> {
-    value_if_enough_data: T,
-    enough_data: bool,
+#[must_use]
+#[repr(transparent)]
+struct BitResult<T> {
+    value_if_not_past_eof: T,
 }
+
+#[must_use]
+struct BitResultAccumulator;
+
+#[must_use]
+struct CheckedBitResult;
 
 impl BitResult<()> {
-    const OK: Self = Self::ok(());
-    const ERR: Self = Self::err(());
+    const OK: BitResultAccumulator = BitResultAccumulator;
 }
 
-impl<T: Copy> BitResult<T> {
+impl<T> BitResult<T> {
     const fn ok(value: T) -> Self {
         Self {
-            value_if_enough_data: value,
-            enough_data: true,
+            value_if_not_past_eof: value,
         }
     }
 
-    const fn err(value: T) -> Self {
-        Self {
-            value_if_enough_data: value,
-            enough_data: false,
-        }
-    }
-
-    fn is_err(&self) -> bool {
-        !self.enough_data
-    }
-
-    fn or_accumulate(self, acc: &mut BitResult<()>) -> T {
-        acc.enough_data &= self.enough_data;
-        self.value_if_enough_data
-    }
-
-    fn then<S: Copy>(self, value: S) -> BitResult<S> {
-        BitResult {
-            value_if_enough_data: value,
-            enough_data: self.enough_data,
-        }
-    }
-
-    fn as_result(self) -> Result<T, DecodingError> {
-        if self.enough_data {
-            Ok(self.value_if_enough_data)
-        } else {
-            Err(DecodingError::BitStreamError)
-        }
-    }
-
-    #[cfg(test)]
-    fn unwrap(self) -> T {
-        self.as_result().unwrap()
+    fn or_accumulate(self, _acc: &mut BitResultAccumulator) -> T {
+        self.value_if_not_past_eof
     }
 }
 
-impl<T: Copy> From<BitResult<T>> for Result<T, DecodingError> {
-    fn from(result: BitResult<T>) -> Result<T, DecodingError> {
-        result.as_result()
+impl<T: Default> BitResult<T> {
+    fn err() -> Self {
+        Self {
+            value_if_not_past_eof: T::default(),
+        }
+    }
+}
+
+impl CheckedBitResult {
+    pub fn then<T>(self, value_if_not_past_eof: T) -> BitResult<T> {
+        BitResult {
+            value_if_not_past_eof,
+        }
     }
 }
 
@@ -776,8 +758,33 @@ impl BoolReader {
         Ok(())
     }
 
+    fn check<T>(
+        &self,
+        acc: BitResultAccumulator,
+        value_if_not_past_eof: T,
+    ) -> Result<T, DecodingError> {
+        let BitResultAccumulator = acc;
+        if self.is_past_eof() {
+            Err(DecodingError::BitStreamError)
+        } else {
+            Ok(value_if_not_past_eof)
+        }
+    }
+
+    fn check_directly<T>(&self, result: BitResult<T>) -> Result<T, DecodingError> {
+        let mut acc = BitResult::OK;
+        let value = result.or_accumulate(&mut acc);
+        self.check(acc, value)
+    }
+
+    const FINAL_BYTES_REMAINING_EOF: i32 = -0xE0F;
+
+    fn is_past_eof(&self) -> bool {
+        self.final_bytes_remaining == Self::FINAL_BYTES_REMAINING_EOF
+    }
+
     #[cold]
-    fn load_final_bytes(&mut self) -> BitResult<()> {
+    fn load_final_bytes(&mut self) {
         if self.final_bytes_remaining > 0 {
             self.final_bytes_remaining -= 1;
             let byte = self.final_bytes[0];
@@ -785,16 +792,14 @@ impl BoolReader {
             self.value <<= 8;
             self.value |= u64::from(byte);
             self.bit_count += 8;
-            BitResult::OK
         } else if self.final_bytes_remaining == 0 {
             // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
             // This replicates that logic.
             self.final_bytes_remaining -= 1;
             self.value <<= 8;
             self.bit_count += 8;
-            BitResult::OK
         } else {
-            BitResult::ERR
+            self.final_bytes_remaining = Self::FINAL_BYTES_REMAINING_EOF;
         }
     }
 
@@ -802,8 +807,9 @@ impl BoolReader {
     #[inline(never)]
     fn cold_read_bit_from_final_bytes(&mut self, probability: u32) -> BitResult<bool> {
         if self.bit_count < 0 {
-            if self.load_final_bytes().is_err() {
-                return BitResult::err(false);
+            self.load_final_bytes();
+            if self.is_past_eof() {
+                return BitResult::err();
             }
         }
         debug_assert!(self.bit_count >= 0);
@@ -1619,10 +1625,10 @@ impl<R: Read> Vp8Decoder<R> {
         let mut mb = MacroBlock::default();
 
         if self.segments_enabled && self.segments_update_map {
-            mb.segmentid = self
+            let res = self
                 .b
-                .read_with_tree(&SEGMENT_ID_TREE, &self.segment_tree_probs, 0)
-                .as_result()? as u8;
+                .read_with_tree(&SEGMENT_ID_TREE, &self.segment_tree_probs, 0);
+            mb.segmentid = self.b.check_directly(res)? as u8;
         };
 
         mb.coeffs_skipped = if let Some(prob) = self.prob_skip_false {
