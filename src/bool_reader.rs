@@ -39,7 +39,6 @@ impl<T: Default> BitResult<T> {
 pub(crate) struct BoolReader {
     chunks: Box<[[u8; 4]]>,
     state: State,
-    backup_state: State,
     final_bytes: [u8; 3],
     final_bytes_remaining: i8,
 }
@@ -56,7 +55,8 @@ struct State {
 #[cfg_attr(test, derive(Debug))]
 struct FastReader<'a> {
     chunks: &'a [[u8; 4]],
-    state: &'a mut State,
+    uncommitted_state: State,
+    save_state: &'a mut State,
 }
 
 impl BoolReader {
@@ -72,7 +72,6 @@ impl BoolReader {
             state,
             final_bytes: [0; 3],
             final_bytes_remaining: Self::FINAL_BYTES_REMAINING_EOF,
-            backup_state: state,
         }
     }
 
@@ -109,7 +108,6 @@ impl BoolReader {
             state,
             final_bytes,
             final_bytes_remaining,
-            backup_state: state,
         };
         Ok(())
     }
@@ -213,19 +211,18 @@ impl BoolReader {
     fn fast<'a>(&'a mut self) -> FastReader<'a> {
         FastReader {
             chunks: &self.chunks,
-            state: &mut self.state,
+            uncommitted_state: self.state,
+            save_state: &mut self.state,
         }
     }
 
     pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
         let probability = u32::from(probability);
 
-        self.backup_state = self.state;
         if let Some(b) = self.fast().read_bit(probability) {
             return BitResult::ok(b);
         }
 
-        self.state = self.backup_state;
         self.cold_read_bool(probability)
     }
 
@@ -236,12 +233,10 @@ impl BoolReader {
     }
 
     pub(crate) fn read_literal(&mut self, n: u8) -> BitResult<u8> {
-        self.backup_state = self.state;
         if let Some(v) = self.fast().read_literal(n) {
             return BitResult::ok(v);
         }
 
-        self.state = self.backup_state;
         self.cold_read_literal(n)
     }
 
@@ -260,12 +255,10 @@ impl BoolReader {
     }
 
     pub(crate) fn read_magnitude_and_sign(&mut self, n: u8) -> BitResult<i32> {
-        self.backup_state = self.state;
         if let Some(v) = self.fast().read_magnitude_and_sign(n) {
             return BitResult::ok(v);
         }
 
-        self.state = self.backup_state;
         self.cold_read_magnitude_and_sign(n)
     }
 
@@ -290,19 +283,18 @@ impl BoolReader {
         probs: &[u8],
         start: usize,
     ) -> BitResult<i8> {
-        self.backup_state = self.state;
+        debug_assert_eq!(probs.len() * 2, tree.len());
+        debug_assert!(start + 1 < tree.len());
+
         if let Some(v) = self.fast().read_with_tree(tree, probs, start) {
             return BitResult::ok(v);
         }
 
-        self.state = self.backup_state;
         self.cold_read_with_tree(tree, probs, start)
     }
 
     #[cold]
     fn cold_read_with_tree(&mut self, tree: &[i8], probs: &[u8], start: usize) -> BitResult<i8> {
-        assert_eq!(probs.len() * 2, tree.len());
-        assert!(start + 1 < tree.len());
         let mut index = start;
         let mut res = BitResult::OK;
 
@@ -328,41 +320,38 @@ impl BoolReader {
 }
 
 impl<'a> FastReader<'a> {
-    fn is_valid(&self) -> bool {
-        self.state.chunk_index < self.chunks.len()
-    }
-
-    fn check<T>(&self, acc: BitResultAccumulator, value_if_not_past_eof: T) -> Option<T> {
+    fn commit_if_valid<T>(self, acc: BitResultAccumulator, value_if_not_past_eof: T) -> Option<T> {
         let _ = acc;
-        if self.is_valid() {
+        if self.uncommitted_state.chunk_index < self.chunks.len() {
+            *self.save_state = self.uncommitted_state;
             Some(value_if_not_past_eof)
         } else {
             None
         }
     }
 
-    fn read_bit(&mut self, probability: u32) -> Option<bool> {
+    fn read_bit(mut self, probability: u32) -> Option<bool> {
         let mut res = BitResult::OK;
         let b = self.fast_read_bit(probability, &mut res);
-        self.check(res, b)
+        self.commit_if_valid(res, b)
     }
 
-    fn read_literal(&mut self, n: u8) -> Option<u8> {
+    fn read_literal(mut self, n: u8) -> Option<u8> {
         let mut res = BitResult::OK;
         let b = self.fast_read_literal(n, &mut res);
-        self.check(res, b)
+        self.commit_if_valid(res, b)
     }
 
-    fn read_magnitude_and_sign(&mut self, n: u8) -> Option<i32> {
+    fn read_magnitude_and_sign(mut self, n: u8) -> Option<i32> {
         let mut res = BitResult::OK;
         let b = self.fast_read_magnitude_and_sign(n, &mut res);
-        self.check(res, b)
+        self.commit_if_valid(res, b)
     }
 
-    fn read_with_tree(&mut self, tree: &[i8], probs: &[u8], start: usize) -> Option<i8> {
+    fn read_with_tree(mut self, tree: &[i8], probs: &[u8], start: usize) -> Option<i8> {
         let mut res = BitResult::OK;
         let b = self.fast_read_with_tree(tree, probs, start, &mut res);
-        self.check(res, b)
+        self.commit_if_valid(res, b)
     }
 
     fn fast_read_bit(&mut self, probability: u32, acc: &mut BitResultAccumulator) -> bool {
@@ -371,7 +360,7 @@ impl<'a> FastReader<'a> {
             mut value,
             mut range,
             mut bit_count,
-        } = *self.state;
+        } = self.uncommitted_state;
 
         if bit_count < 0 {
             let chunk = match self.chunks.get(chunk_index).copied() {
@@ -410,7 +399,7 @@ impl<'a> FastReader<'a> {
         bit_count -= shift as i32;
         debug_assert!(range >= 128);
 
-        *self.state = State {
+        self.uncommitted_state = State {
             chunk_index,
             value,
             range,
@@ -445,8 +434,6 @@ impl<'a> FastReader<'a> {
         start: usize,
         acc: &mut BitResultAccumulator,
     ) -> i8 {
-        assert_eq!(probs.len() * 2, tree.len());
-        assert!(start + 1 < tree.len());
         let mut index = start;
 
         loop {
