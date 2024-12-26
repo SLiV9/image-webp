@@ -101,23 +101,56 @@ enum IntraMode {
 
 type Prob = u8;
 
-static SEGMENT_ID_TREE: [i8; 6] = [2, 4, -0, -1, -2, -3];
+#[derive(Clone, Copy)]
+pub(crate) struct TreeNode {
+    pub bits: u8,
+    pub prob: Prob,
+}
+
+impl TreeNode {
+    const UNINIT: TreeNode = TreeNode { bits: 0, prob: 0 };
+}
+
+const fn tree_nodes_from<const N: usize, const M: usize>(
+    tree: [i8; N],
+    probs: [Prob; M],
+) -> [TreeNode; N] {
+    if N != 2 * M {
+        panic!("invalid tree with probs");
+    }
+    let mut nodes = [TreeNode::UNINIT; N];
+    let mut i = 0;
+    while i < N {
+        let t = tree[i];
+        nodes[i].bits = if t > 0 { t as u8 } else { (-t as u8) | 0x80 };
+        nodes[i].prob = probs[i / 2];
+        i += 1;
+    }
+    nodes
+}
+
+const SEGMENT_ID_TREE: [i8; 6] = [2, 4, -0, -1, -2, -3];
+
+const SEGMENT_TREE_NODE_DEFAULTS: [TreeNode; 6] = tree_nodes_from(SEGMENT_ID_TREE, [255; 3]);
 
 // Section 11.2
 // Tree for determining the keyframe luma intra prediction modes:
-static KEYFRAME_YMODE_TREE: [i8; 8] = [-B_PRED, 2, 4, 6, -DC_PRED, -V_PRED, -H_PRED, -TM_PRED];
+const KEYFRAME_YMODE_TREE: [i8; 8] = [-B_PRED, 2, 4, 6, -DC_PRED, -V_PRED, -H_PRED, -TM_PRED];
 
 // Default probabilities for decoding the keyframe luma modes
-static KEYFRAME_YMODE_PROBS: [Prob; 4] = [145, 156, 163, 128];
+const KEYFRAME_YMODE_PROBS: [Prob; 4] = [145, 156, 163, 128];
+
+const KEYFRAME_YMODE_NODES: [TreeNode; 8] =
+    tree_nodes_from(KEYFRAME_YMODE_TREE, KEYFRAME_YMODE_PROBS);
 
 // Tree for determining the keyframe B_PRED mode:
-static KEYFRAME_BPRED_MODE_TREE: [i8; 18] = [
+const KEYFRAME_BPRED_MODE_TREE: [i8; 18] = [
     -B_DC_PRED, 2, -B_TM_PRED, 4, -B_VE_PRED, 6, 8, 12, -B_HE_PRED, 10, -B_RD_PRED, -B_VR_PRED,
     -B_LD_PRED, 14, -B_VL_PRED, 16, -B_HD_PRED, -B_HU_PRED,
 ];
 
 // Probabilities for the BPRED_MODE_TREE
-static KEYFRAME_BPRED_MODE_PROBS: [[[Prob; 9]; 10]; 10] = [
+const KEYFRAME_BPRED_MODE_PROBS: [[[Prob; 9]; 10]; 10] = [
     [
         [231, 120, 48, 89, 115, 113, 120, 152, 112],
         [152, 179, 64, 126, 170, 118, 46, 70, 95],
@@ -240,17 +273,36 @@ static KEYFRAME_BPRED_MODE_PROBS: [[[Prob; 9]; 10]; 10] = [
     ],
 ];
 
+const KEYFRAME_BPRED_MODE_NODES: [[[TreeNode; 18]; 10]; 10] = {
+    let mut output = [[[TreeNode::UNINIT; 18]; 10]; 10];
+    let mut i = 0;
+    while i < output.len() {
+        let mut j = 0;
+        while j < output[i].len() {
+            output[i][j] =
+                tree_nodes_from(KEYFRAME_BPRED_MODE_TREE, KEYFRAME_BPRED_MODE_PROBS[i][j]);
+            j += 1;
+        }
+        i += 1;
+    }
+    output
+};
+
 // Section 11.4 Tree for determining macroblock the chroma mode
-static KEYFRAME_UV_MODE_TREE: [i8; 6] = [-DC_PRED, 2, -V_PRED, 4, -H_PRED, -TM_PRED];
+const KEYFRAME_UV_MODE_TREE: [i8; 6] = [-DC_PRED, 2, -V_PRED, 4, -H_PRED, -TM_PRED];
 
 // Probabilities for determining macroblock mode
-static KEYFRAME_UV_MODE_PROBS: [Prob; 3] = [142, 114, 183];
+const KEYFRAME_UV_MODE_PROBS: [Prob; 3] = [142, 114, 183];
+
+const KEYFRAME_UV_MODE_NODES: [TreeNode; 6] =
+    tree_nodes_from(KEYFRAME_UV_MODE_TREE, KEYFRAME_UV_MODE_PROBS);
 
 // Section 13.4
 type TokenProbTables = [[[[Prob; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
+type TokenProbTreeNodes = [[[[TreeNode; 2 * (NUM_DCT_TOKENS - 1)]; 3]; 8]; 4];
 
 // Probabilities that a token's probability will be updated
-static COEFF_UPDATE_PROBS: TokenProbTables = [
+const COEFF_UPDATE_PROBS: TokenProbTables = [
     [
         [
             [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
@@ -423,7 +475,7 @@ static COEFF_UPDATE_PROBS: TokenProbTables = [
 
 // Section 13.5
 // Default Probabilities for tokens
-static COEFF_PROBS: TokenProbTables = [
+const COEFF_PROBS: TokenProbTables = [
     [
         [
             [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
@@ -593,6 +645,24 @@ static COEFF_PROBS: TokenProbTables = [
         ],
     ],
 ];
+
+const COEFF_PROB_NODES: TokenProbTreeNodes = {
+    let mut output = [[[[TreeNode::UNINIT; 22]; 3]; 8]; 4];
+    let mut i = 0;
+    while i < output.len() {
+        let mut j = 0;
+        while j < output[i].len() {
+            let mut k = 0;
+            while k < output[i][j].len() {
+                output[i][j][k] = tree_nodes_from(DCT_TOKEN_TREE, COEFF_PROBS[i][j][k]);
+                k += 1;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    output
+};
 
 // DCT Tokens
 const DCT_0: i8 = 0;
@@ -950,8 +1020,8 @@ pub struct Vp8Decoder<R> {
     partitions: [BoolReader; 8],
     num_partitions: u8,
 
-    segment_tree_probs: [Prob; 3],
-    token_probs: Box<TokenProbTables>,
+    segment_tree_nodes: [TreeNode; 6],
+    token_probs: Box<TokenProbTreeNodes>,
 
     // Section 9.10
     prob_intra: Prob,
@@ -1003,8 +1073,8 @@ impl<R: Read> Vp8Decoder<R> {
 
             num_partitions: 1,
 
-            segment_tree_probs: [255u8; 3],
-            token_probs: Box::new(COEFF_PROBS),
+            segment_tree_nodes: SEGMENT_TREE_NODE_DEFAULTS,
+            token_probs: Box::new(COEFF_PROB_NODES),
 
             // Section 9.10
             prob_intra: 0u8,
@@ -1028,7 +1098,8 @@ impl<R: Read> Vp8Decoder<R> {
                     for (t, prob) in ks.iter().enumerate().take(NUM_DCT_TOKENS - 1) {
                         if self.b.read_bool(*prob).or_accumulate(&mut res) {
                             let v = self.b.read_literal(8).or_accumulate(&mut res);
-                            self.token_probs[i][j][k][t] = v;
+                            self.token_probs[i][j][k][2 * t].prob = v;
+                            self.token_probs[i][j][k][2 * t + 1].prob = v;
                         }
                     }
                 }
@@ -1212,11 +1283,13 @@ impl<R: Read> Vp8Decoder<R> {
             for i in 0usize..3 {
                 let update = self.b.read_flag().or_accumulate(&mut res);
 
-                self.segment_tree_probs[i] = if update {
+                let prob = if update {
                     self.b.read_literal(8).or_accumulate(&mut res)
                 } else {
                     255
                 };
+                self.segment_tree_nodes[i * 2].prob = prob;
+                self.segment_tree_nodes[i * 2 + 1].prob = prob;
             }
         }
 
@@ -1344,9 +1417,7 @@ impl<R: Read> Vp8Decoder<R> {
         let mut mb = MacroBlock::default();
 
         if self.segments_enabled && self.segments_update_map {
-            let res = self
-                .b
-                .read_with_tree(&SEGMENT_ID_TREE, &self.segment_tree_probs, 0);
+            let res = self.b.read_with_tree(&self.segment_tree_nodes);
             mb.segmentid = self.b.check_directly(res)? as u8;
         };
 
@@ -1372,9 +1443,7 @@ impl<R: Read> Vp8Decoder<R> {
 
         if self.frame.keyframe {
             // intra prediction
-            let res = self
-                .b
-                .read_with_tree(&KEYFRAME_YMODE_TREE, &KEYFRAME_YMODE_PROBS, 0);
+            let res = self.b.read_with_tree(&KEYFRAME_YMODE_NODES);
             let luma = self.b.check_directly(res)?;
             mb.luma_mode =
                 LumaMode::from_i8(luma).ok_or(DecodingError::LumaPredictionModeInvalid(luma))?;
@@ -1387,9 +1456,7 @@ impl<R: Read> Vp8Decoder<R> {
                             let top = self.top[mbx].bpred[12 + x];
                             let left = self.left.bpred[y];
                             let res = self.b.read_with_tree(
-                                &KEYFRAME_BPRED_MODE_TREE,
-                                &KEYFRAME_BPRED_MODE_PROBS[top as usize][left as usize],
-                                0,
+                                &KEYFRAME_BPRED_MODE_NODES[top as usize][left as usize],
                             );
                             let intra = self.b.check_directly(res)?;
                             let bmode = IntraMode::from_i8(intra)
@@ -1409,9 +1476,7 @@ impl<R: Read> Vp8Decoder<R> {
                 }
             }
 
-            let res = self
-                .b
-                .read_with_tree(&KEYFRAME_UV_MODE_TREE, &KEYFRAME_UV_MODE_PROBS, 0);
+            let res = self.b.read_with_tree(&KEYFRAME_UV_MODE_NODES);
             let chroma = self.b.check_directly(res)?;
             mb.chroma_mode = ChromaMode::from_i8(chroma)
                 .ok_or(DecodingError::ChromaPredictionModeInvalid(chroma))?;
@@ -1600,7 +1665,6 @@ impl<R: Read> Vp8Decoder<R> {
 
         let first = if plane == 0 { 1usize } else { 0usize };
         let probs = &self.token_probs[plane];
-        let tree = &DCT_TOKEN_TREE;
         let reader = &mut self.partitions[p];
 
         let mut complexity = complexity;
@@ -1608,15 +1672,13 @@ impl<R: Read> Vp8Decoder<R> {
         let mut skip = false;
 
         for i in first..16usize {
-            let table = &probs[COEFF_BANDS[i] as usize][complexity];
+            let tree = &probs[COEFF_BANDS[i] as usize][complexity];
 
             let token = if !skip {
-                reader
-                    .read_with_tree(tree, table, 0)
-                    .or_accumulate(&mut res)
+                reader.read_with_tree(tree).or_accumulate(&mut res)
             } else {
                 reader
-                    .read_with_tree(tree, table, 2)
+                    .read_with_tree_and_start::<22, 2>(tree)
                     .or_accumulate(&mut res)
             };
 
