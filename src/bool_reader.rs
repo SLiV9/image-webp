@@ -42,8 +42,8 @@ pub(crate) struct BoolReader {
     value: u64,
     range: u32,
     bit_count: i32,
-    final_bytes: [u8; 4],
-    final_bytes_remaining: i32,
+    final_bytes: [u8; 3],
+    final_bytes_remaining: i8,
 }
 
 impl BoolReader {
@@ -53,23 +53,32 @@ impl BoolReader {
             chunk_index: 0,
             value: 0,
             range: 0,
-            bit_count: 0,
-            final_bytes: [0; 4],
-            final_bytes_remaining: 0,
+            bit_count: -8,
+            final_bytes: [0; 3],
+            final_bytes_remaining: Self::FINAL_BYTES_REMAINING_EOF,
         }
     }
 
     pub(crate) fn init(&mut self, mut buf: Vec<[u8; 4]>, len: usize) -> Result<(), DecodingError> {
-        // Pop the last chunk (which may be partial), then get length.
-        let Some(last_chunk) = buf.pop() else {
-            return Err(DecodingError::NotEnoughInitData);
+        let mut final_bytes = [0; 3];
+        let final_bytes_remaining = if len == 4 * buf.len() {
+            0
+        } else {
+            // Pop the last chunk (which is partial), then get length.
+            let Some(last_chunk) = buf.pop() else {
+                return Err(DecodingError::NotEnoughInitData);
+            };
+            let len_rounded_down = 4 * buf.len();
+            let num_bytes_popped = len - len_rounded_down;
+            debug_assert!(num_bytes_popped <= 3);
+            for i in 0..num_bytes_popped {
+                final_bytes[i] = last_chunk[i];
+            }
+            for i in num_bytes_popped..4 {
+                debug_assert_eq!(last_chunk[i], 0, "unexpected {last_chunk:?}");
+            }
+            num_bytes_popped as i8
         };
-        let len_rounded_down = 4 * buf.len();
-        let num_bytes_popped = len - len_rounded_down;
-        debug_assert!(num_bytes_popped <= 4);
-        for i in num_bytes_popped..4 {
-            debug_assert_eq!(last_chunk[i], 0, "unexpected {last_chunk:?}");
-        }
 
         let chunks = buf.into_boxed_slice();
         *self = Self {
@@ -78,8 +87,8 @@ impl BoolReader {
             value: 0,
             range: 255,
             bit_count: -8,
-            final_bytes: last_chunk,
-            final_bytes_remaining: num_bytes_popped as i32,
+            final_bytes,
+            final_bytes_remaining,
         };
         Ok(())
     }
@@ -110,7 +119,7 @@ impl BoolReader {
         BitResult::ok(value_if_not_past_eof)
     }
 
-    const FINAL_BYTES_REMAINING_EOF: i32 = -0xE0F;
+    const FINAL_BYTES_REMAINING_EOF: i8 = -0xE;
 
     #[cold]
     fn load_final_bytes(&mut self) {
@@ -322,5 +331,14 @@ mod tests {
         assert_eq!(185, reader.read_literal(8).or_accumulate(&mut res));
         assert_eq!(31, reader.read_literal(8).or_accumulate(&mut res));
         reader.check(res, ()).unwrap();
+    }
+
+    #[test]
+    fn test_bool_reader_uninit() {
+        let mut reader = BoolReader::new();
+        let mut res = BitResult::OK;
+        let _ = reader.read_flag().or_accumulate(&mut res);
+        let result = reader.check(res, ());
+        assert!(result.is_err());
     }
 }
