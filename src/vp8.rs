@@ -1018,21 +1018,6 @@ struct Segment {
     loopfilter_level: i8,
 }
 
-impl Vp8Decoder<std::io::Empty> {
-    /// YOLO
-    pub fn hello(
-        &mut self,
-        block: &mut [i32; 16],
-        p: usize,
-        plane: usize,
-        complexity: usize,
-        dcq: i16,
-        acq: i16,
-    ) -> Result<bool, DecodingError> {
-        self.read_coefficients(block, p, plane, complexity, dcq, acq)
-    }
-}
-
 /// VP8 Decoder
 ///
 /// Only decodes keyframes
@@ -1183,35 +1168,11 @@ impl<R: Read> Vp8Decoder<R> {
         let mut res = BitResult::OK;
 
         let yac_abs = self.b.read_literal(7).or_accumulate(&mut res);
-        let ydc_delta = if self.b.read_flag().or_accumulate(&mut res) {
-            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
-        } else {
-            0
-        };
-
-        let y2dc_delta = if self.b.read_flag().or_accumulate(&mut res) {
-            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
-        } else {
-            0
-        };
-
-        let y2ac_delta = if self.b.read_flag().or_accumulate(&mut res) {
-            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
-        } else {
-            0
-        };
-
-        let uvdc_delta = if self.b.read_flag().or_accumulate(&mut res) {
-            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
-        } else {
-            0
-        };
-
-        let uvac_delta = if self.b.read_flag().or_accumulate(&mut res) {
-            self.b.read_magnitude_and_sign(4).or_accumulate(&mut res)
-        } else {
-            0
-        };
+        let ydc_delta = self.b.read_optional_signed_value(4).or_accumulate(&mut res);
+        let y2dc_delta = self.b.read_optional_signed_value(4).or_accumulate(&mut res);
+        let y2ac_delta = self.b.read_optional_signed_value(4).or_accumulate(&mut res);
+        let uvdc_delta = self.b.read_optional_signed_value(4).or_accumulate(&mut res);
+        let uvac_delta = self.b.read_optional_signed_value(4).or_accumulate(&mut res);
 
         let n = if self.segments_enabled {
             MAX_SEGMENTS
@@ -1256,23 +1217,11 @@ impl<R: Read> Vp8Decoder<R> {
 
         if self.b.read_flag().or_accumulate(&mut res) {
             for i in 0usize..4 {
-                let ref_frame_delta_update_flag = self.b.read_flag().or_accumulate(&mut res);
-
-                self.ref_delta[i] = if ref_frame_delta_update_flag {
-                    self.b.read_magnitude_and_sign(6).or_accumulate(&mut res)
-                } else {
-                    0i32
-                };
+                self.ref_delta[i] = self.b.read_optional_signed_value(6).or_accumulate(&mut res);
             }
 
             for i in 0usize..4 {
-                let mb_mode_delta_update_flag = self.b.read_flag().or_accumulate(&mut res);
-
-                self.mode_delta[i] = if mb_mode_delta_update_flag {
-                    self.b.read_magnitude_and_sign(6).or_accumulate(&mut res)
-                } else {
-                    0i32
-                };
+                self.mode_delta[i] = self.b.read_optional_signed_value(6).or_accumulate(&mut res);
             }
         }
 
@@ -1294,23 +1243,13 @@ impl<R: Read> Vp8Decoder<R> {
             }
 
             for i in 0usize..MAX_SEGMENTS {
-                let update = self.b.read_flag().or_accumulate(&mut res);
-
-                self.segment[i].quantizer_level = if update {
-                    self.b.read_magnitude_and_sign(7).or_accumulate(&mut res)
-                } else {
-                    0i32
-                } as i8;
+                self.segment[i].quantizer_level =
+                    self.b.read_optional_signed_value(7).or_accumulate(&mut res) as i8;
             }
 
             for i in 0usize..MAX_SEGMENTS {
-                let update = self.b.read_flag().or_accumulate(&mut res);
-
-                self.segment[i].loopfilter_level = if update {
-                    self.b.read_magnitude_and_sign(6).or_accumulate(&mut res)
-                } else {
-                    0i32
-                } as i8;
+                self.segment[i].loopfilter_level =
+                    self.b.read_optional_signed_value(6).or_accumulate(&mut res) as i8;
             }
         }
 

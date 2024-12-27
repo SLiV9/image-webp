@@ -219,6 +219,7 @@ impl BoolReader {
         }
     }
 
+    #[inline(never)]
     pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
         if let Some(b) = self.fast().read_bit(probability) {
             return BitResult::ok(b);
@@ -233,6 +234,7 @@ impl BoolReader {
         self.cold_read_bit(probability)
     }
 
+    #[inline(never)]
     pub(crate) fn read_literal(&mut self, n: u8) -> BitResult<u8> {
         if let Some(v) = self.fast().read_literal(n) {
             return BitResult::ok(v);
@@ -255,18 +257,24 @@ impl BoolReader {
         self.accumulated(res, v)
     }
 
-    pub(crate) fn read_magnitude_and_sign(&mut self, n: u8) -> BitResult<i32> {
-        if let Some(v) = self.fast().read_magnitude_and_sign(n) {
+    #[inline(never)]
+    pub(crate) fn read_optional_signed_value(&mut self, n: u8) -> BitResult<i32> {
+        if let Some(v) = self.fast().read_optional_signed_value(n) {
             return BitResult::ok(v);
         }
 
-        self.cold_read_magnitude_and_sign(n)
+        self.cold_read_optional_signed_value(n)
     }
 
     #[cold]
     #[inline(never)]
-    fn cold_read_magnitude_and_sign(&mut self, n: u8) -> BitResult<i32> {
+    fn cold_read_optional_signed_value(&mut self, n: u8) -> BitResult<i32> {
         let mut res = BitResult::OK;
+        let flag = self.cold_read_bool(128).or_accumulate(&mut res);
+        if !flag {
+            // We should not read further bits if the flag is not set.
+            return self.accumulated(res, 0);
+        }
         let magnitude = self.cold_read_literal(n).or_accumulate(&mut res);
         let sign = self.cold_read_bool(128).or_accumulate(&mut res);
 
@@ -278,11 +286,13 @@ impl BoolReader {
         self.accumulated(res, value)
     }
 
+    #[inline]
     pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {
         let first_node = tree[0];
         self.read_with_tree_with_first_node(tree, first_node)
     }
 
+    #[inline(never)]
     pub(crate) fn read_with_tree_with_first_node(
         &mut self,
         tree: &[TreeNode],
@@ -315,6 +325,7 @@ impl BoolReader {
         }
     }
 
+    #[inline]
     pub(crate) fn read_flag(&mut self) -> BitResult<bool> {
         self.read_bool(128)
     }
@@ -333,26 +344,37 @@ impl<'a> FastReader<'a> {
 
     fn read_bit(mut self, probability: u8) -> Option<bool> {
         let mut res = BitResult::OK;
-        let b = self.fast_read_bit(probability, &mut res);
-        self.commit_if_valid(res, b)
+        let bit = self.fast_read_bit(probability, &mut res);
+        self.commit_if_valid(res, bit)
     }
 
     fn read_literal(mut self, n: u8) -> Option<u8> {
         let mut res = BitResult::OK;
-        let b = self.fast_read_literal(n, &mut res);
-        self.commit_if_valid(res, b)
+        let value = self.fast_read_literal(n, &mut res);
+        self.commit_if_valid(res, value)
     }
 
-    fn read_magnitude_and_sign(mut self, n: u8) -> Option<i32> {
+    fn read_optional_signed_value(mut self, n: u8) -> Option<i32> {
         let mut res = BitResult::OK;
-        let b = self.fast_read_magnitude_and_sign(n, &mut res);
-        self.commit_if_valid(res, b)
+        let flag = self.fast_read_bit(128, &mut res);
+        if !flag {
+            // We should not read further bits if the flag is not set.
+            return self.commit_if_valid(res, 0);
+        }
+        let magnitude = self.fast_read_literal(n, &mut res);
+        let sign = self.fast_read_bit(128, &mut res);
+        let value = if sign {
+            -i32::from(magnitude)
+        } else {
+            i32::from(magnitude)
+        };
+        self.commit_if_valid(res, value)
     }
 
     fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {
         let mut res = BitResult::OK;
-        let b = self.fast_read_with_tree(tree, first_node, &mut res);
-        self.commit_if_valid(res, b)
+        let value = self.fast_read_with_tree(tree, first_node, &mut res);
+        self.commit_if_valid(res, value)
     }
 
     fn fast_read_bit(&mut self, probability: u8, acc: &mut BitResultAccumulator) -> bool {
@@ -417,16 +439,6 @@ impl<'a> FastReader<'a> {
             v = (v << 1) + b as u8;
         }
         v
-    }
-
-    fn fast_read_magnitude_and_sign(&mut self, n: u8, acc: &mut BitResultAccumulator) -> i32 {
-        let magnitude = self.fast_read_literal(n, acc);
-        let sign = self.fast_read_bit(128, acc);
-        if sign {
-            -i32::from(magnitude)
-        } else {
-            i32::from(magnitude)
-        }
     }
 
     fn fast_read_with_tree(
