@@ -1723,10 +1723,11 @@ impl<R: Read> Vp8Decoder<R> {
         mb: &MacroBlock,
         mbx: usize,
         p: usize,
-    ) -> Result<[[[i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS], DecodingError> {
+        blocks: &mut [[[i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS],
+    ) -> Result<(), DecodingError> {
         let sindex = mb.segmentid as usize;
-        let mut blocks = [[[0i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS];
         let mut plane = if mb.luma_mode == LumaMode::B { 3 } else { 1 };
+        let mut ns = [false; NUM_RESIDUAL_DATA_BLOCKS];
 
         if plane == 1 {
             let complexity = self.top[mbx].complexity[0] + self.left.complexity[0];
@@ -1762,9 +1763,7 @@ impl<R: Read> Vp8Decoder<R> {
 
                 let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
 
-                if block[0][0] != 0 || n {
-                    transform::idct4x4(block);
-                }
+                ns[i] = n | (block[0][0] != 0);
 
                 left = if n { 1 } else { 0 };
                 self.top[mbx].complexity[x + 1] = if n { 1 } else { 0 };
@@ -1789,9 +1788,8 @@ impl<R: Read> Vp8Decoder<R> {
 
                     let n =
                         self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
-                    if block[0][0] != 0 || n {
-                        transform::idct4x4(block);
-                    }
+
+                    ns[i] = n | (block[0][0] != 0);
 
                     left = if n { 1 } else { 0 };
                     self.top[mbx].complexity[x + j] = if n { 1 } else { 0 };
@@ -1801,7 +1799,9 @@ impl<R: Read> Vp8Decoder<R> {
             }
         }
 
-        Ok(blocks)
+        transform_residual_data_blocks(blocks, &ns);
+
+        Ok(())
     }
 
     /// Does loop filtering on the macroblock
@@ -2138,8 +2138,9 @@ impl<R: Read> Vp8Decoder<R> {
 
             for mbx in 0..self.mbwidth as usize {
                 let mb = self.read_macroblock_header(mbx)?;
-                let blocks = if !mb.coeffs_skipped {
-                    self.read_residual_data(&mb, mbx, p)?
+                let mut blocks = [[[0i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS];
+                if !mb.coeffs_skipped {
+                    self.read_residual_data(&mb, mbx, p, &mut blocks)?;
                 } else {
                     if mb.luma_mode != LumaMode::B {
                         self.left.complexity[0] = 0;
@@ -2150,9 +2151,7 @@ impl<R: Read> Vp8Decoder<R> {
                         self.left.complexity[i] = 0;
                         self.top[mbx].complexity[i] = 0;
                     }
-
-                    [[[0i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS]
-                };
+                }
 
                 self.intra_predict_luma(mbx, mby, &mb, &blocks);
                 self.intra_predict_chroma(mbx, mby, &mb, &blocks);
@@ -2308,9 +2307,6 @@ fn avg2(this: u8, right: u8) -> u8 {
     avg as u8
 }
 
-// Only 16 elements from rblock are used to add residue, so it is restricted to 16 elements
-// to enable SIMD and other optimizations.
-//
 // Clippy suggests the clamp method, but it seems to optimize worse as of rustc 1.82.0 nightly.
 #[allow(clippy::manual_clamp)]
 fn add_residue(pblock: &mut [u8], rblock: &[[i32; 4]; 4], y0: usize, x0: usize, stride: usize) {
@@ -2320,6 +2316,20 @@ fn add_residue(pblock: &mut [u8], rblock: &[[i32; 4]; 4], y0: usize, x0: usize, 
             *p = (a + i32::from(*p)).max(0).min(255) as u8;
         }
         pos += stride;
+    }
+}
+
+#[inline(never)]
+fn transform_residual_data_blocks(
+    blocks: &mut [[[i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS],
+    ns: &[bool; NUM_RESIDUAL_DATA_BLOCKS],
+) {
+    for i in 0..NUM_RESIDUAL_DATA_BLOCKS {
+        let block = &mut blocks[i];
+        let n = ns[i];
+        if n {
+            transform::idct4x4(block);
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 const CONST1: i32 = 20091;
 const CONST2: i32 = 35468;
 
+#[inline]
 pub(crate) fn idct4x4(block: &mut [[i32; 4]; 4]) {
     let mut new_block = [[0i32; 4]; 4];
     for x in 0usize..4 {
@@ -56,6 +57,7 @@ pub(crate) fn idct4x4(block: &mut [[i32; 4]; 4]) {
 }
 
 // 14.3
+#[inline]
 pub(crate) fn iwht4x4(block: &mut [[i32; 4]; 4]) {
     let mut new_block = [[0i32; 4]; 4];
     for x in 0usize..4 {
