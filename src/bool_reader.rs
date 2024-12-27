@@ -167,7 +167,7 @@ impl BoolReader {
     }
 
     #[cold]
-    fn cold_read_bit(&mut self, probability: u32) -> BitResult<bool> {
+    fn cold_read_bit(&mut self, probability: u8) -> BitResult<bool> {
         if self.state.bit_count < 0 {
             if let Some(chunk) = self.chunks.get(self.state.chunk_index).copied() {
                 let v = u32::from_be_bytes(chunk);
@@ -184,6 +184,7 @@ impl BoolReader {
         }
         debug_assert!(self.state.bit_count >= 0);
 
+        let probability = u32::from(probability);
         let split = 1 + (((self.state.range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << self.state.bit_count;
 
@@ -219,8 +220,6 @@ impl BoolReader {
     }
 
     pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
-        let probability = u32::from(probability);
-
         if let Some(b) = self.fast().read_bit(probability) {
             return BitResult::ok(b);
         }
@@ -230,7 +229,7 @@ impl BoolReader {
 
     #[cold]
     #[inline(never)]
-    fn cold_read_bool(&mut self, probability: u32) -> BitResult<bool> {
+    fn cold_read_bool(&mut self, probability: u8) -> BitResult<bool> {
         self.cold_read_bit(probability)
     }
 
@@ -303,7 +302,7 @@ impl BoolReader {
 
         loop {
             let node = tree[index];
-            let prob = u32::from(node.prob);
+            let prob = node.prob;
             let b = self.cold_read_bit(prob).or_accumulate(&mut res);
             let t = if b { node.right } else { node.left };
             let new_index = usize::from(t);
@@ -324,7 +323,7 @@ impl BoolReader {
 impl<'a> FastReader<'a> {
     fn commit_if_valid<T>(self, acc: BitResultAccumulator, value_if_not_past_eof: T) -> Option<T> {
         let _ = acc;
-        if self.uncommitted_state.chunk_index < self.chunks.len() {
+        if self.uncommitted_state.chunk_index <= self.chunks.len() {
             *self.save_state = self.uncommitted_state;
             Some(value_if_not_past_eof)
         } else {
@@ -332,7 +331,7 @@ impl<'a> FastReader<'a> {
         }
     }
 
-    fn read_bit(mut self, probability: u32) -> Option<bool> {
+    fn read_bit(mut self, probability: u8) -> Option<bool> {
         let mut res = BitResult::OK;
         let b = self.fast_read_bit(probability, &mut res);
         self.commit_if_valid(res, b)
@@ -356,7 +355,7 @@ impl<'a> FastReader<'a> {
         self.commit_if_valid(res, b)
     }
 
-    fn fast_read_bit(&mut self, probability: u32, acc: &mut BitResultAccumulator) -> bool {
+    fn fast_read_bit(&mut self, probability: u8, acc: &mut BitResultAccumulator) -> bool {
         let State {
             mut chunk_index,
             mut value,
@@ -378,6 +377,7 @@ impl<'a> FastReader<'a> {
         }
         debug_assert!(bit_count >= 0);
 
+        let probability = u32::from(probability);
         let split = 1 + (((range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << bit_count;
 
@@ -436,7 +436,7 @@ impl<'a> FastReader<'a> {
         acc: &mut BitResultAccumulator,
     ) -> i8 {
         loop {
-            let prob = u32::from(node.prob);
+            let prob = node.prob;
             let b = self.fast_read_bit(prob, acc);
             let i = if b { node.right } else { node.left };
             let Some(next_node) = tree.get(usize::from(i)) else {

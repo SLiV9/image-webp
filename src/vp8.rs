@@ -1018,6 +1018,21 @@ struct Segment {
     loopfilter_level: i8,
 }
 
+impl Vp8Decoder<std::io::Empty> {
+    /// YOLO
+    pub fn hello(
+        &mut self,
+        block: &mut [i32; 16],
+        p: usize,
+        plane: usize,
+        complexity: usize,
+        dcq: i16,
+        acq: i16,
+    ) -> Result<bool, DecodingError> {
+        self.read_coefficients(block, p, plane, complexity, dcq, acq)
+    }
+}
+
 /// VP8 Decoder
 ///
 /// Only decodes keyframes
@@ -1691,7 +1706,8 @@ impl<R: Read> Vp8Decoder<R> {
         let mut skip = false;
 
         for i in first..16usize {
-            let tree = &probs[COEFF_BANDS[i] as usize][complexity];
+            let band = COEFF_BANDS[i] as usize;
+            let tree = &probs[band][complexity];
 
             let token = reader
                 .read_with_tree_with_first_node(tree, tree[skip as usize])
@@ -1742,8 +1758,8 @@ impl<R: Read> Vp8Decoder<R> {
                 abs_value = -abs_value;
             }
 
-            block[ZIGZAG[i] as usize] =
-                abs_value * i32::from(if ZIGZAG[i] > 0 { acq } else { dcq });
+            let zigzag = ZIGZAG[i] as usize;
+            block[zigzag] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
 
             has_coefficients = true;
         }
