@@ -320,7 +320,6 @@ const KEYFRAME_UV_MODE_NODES: [TreeNode; 3] =
 
 // Section 13.4
 type TokenProbTables = [[[[Prob; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
-type TokenProbTreeNodes = [[[[TreeNode; NUM_DCT_TOKENS - 1]; 3]; 8]; 4];
 
 // Probabilities that a token's probability will be updated
 const COEFF_UPDATE_PROBS: TokenProbTables = [
@@ -667,23 +666,7 @@ const COEFF_PROBS: TokenProbTables = [
     ],
 ];
 
-const COEFF_PROB_NODES: TokenProbTreeNodes = {
-    let mut output = [[[[TreeNode::UNINIT; 11]; 3]; 8]; 4];
-    let mut i = 0;
-    while i < output.len() {
-        let mut j = 0;
-        while j < output[i].len() {
-            let mut k = 0;
-            while k < output[i][j].len() {
-                output[i][j][k] = tree_nodes_from(DCT_TOKEN_TREE, COEFF_PROBS[i][j][k]);
-                k += 1;
-            }
-            j += 1;
-        }
-        i += 1;
-    }
-    output
-};
+const COEFF_TREE_NODES_WITHOUT_PROBS: [TreeNode; 11] = tree_nodes_from(DCT_TOKEN_TREE, [0; 11]);
 
 // DCT Tokens
 const DCT_0: i8 = 0;
@@ -1042,7 +1025,7 @@ pub struct Vp8Decoder<R> {
     num_partitions: u8,
 
     segment_tree_nodes: [TreeNode; 3],
-    token_probs: Box<TokenProbTreeNodes>,
+    token_probs: Box<TokenProbTables>,
 
     // Section 9.10
     prob_intra: Prob,
@@ -1095,7 +1078,7 @@ impl<R: Read> Vp8Decoder<R> {
             num_partitions: 1,
 
             segment_tree_nodes: SEGMENT_TREE_NODE_DEFAULTS,
-            token_probs: Box::new(COEFF_PROB_NODES),
+            token_probs: Box::new(COEFF_PROBS),
 
             // Section 9.10
             prob_intra: 0u8,
@@ -1119,7 +1102,7 @@ impl<R: Read> Vp8Decoder<R> {
                     for (t, prob) in ks.iter().enumerate().take(NUM_DCT_TOKENS - 1) {
                         if self.b.read_bool(*prob).or_accumulate(&mut res) {
                             let v = self.b.read_literal(8).or_accumulate(&mut res);
-                            self.token_probs[i][j][k][t].prob = v;
+                            self.token_probs[i][j][k][t] = v;
                         }
                     }
                 }
@@ -1638,6 +1621,8 @@ impl<R: Read> Vp8Decoder<R> {
 
         let first = if plane == 0 { 1usize } else { 0usize };
         let probs = &self.token_probs[plane];
+        let mut tree = COEFF_TREE_NODES_WITHOUT_PROBS;
+
         let reader = &mut self.partitions[p];
 
         let mut complexity = complexity;
@@ -1646,10 +1631,13 @@ impl<R: Read> Vp8Decoder<R> {
 
         for i in first..16usize {
             let band = COEFF_BANDS[i] as usize;
-            let tree = &probs[band][complexity];
+            let table = &probs[band][complexity];
+            for (i, prob) in table.iter().copied().enumerate() {
+                tree[i].prob = prob;
+            }
 
             let token = reader
-                .read_with_tree_with_first_node(tree, tree[skip as usize])
+                .read_with_tree_with_first_node(&tree, tree[skip as usize])
                 .or_accumulate(&mut res);
 
             let mut abs_value = i32::from(match token {
