@@ -1663,8 +1663,9 @@ impl<R: Read> Vp8Decoder<R> {
             let token = reader
                 .read_with_tree_with_first_node(tree, tree[skip as usize])
                 .or_accumulate(&mut res);
+            debug_assert!(token >= 0);
 
-            let mut abs_value = i32::from(match token {
+            let mut abs_value: i16 = match token {
                 DCT_EOB => break,
 
                 DCT_0 => {
@@ -1693,17 +1694,12 @@ impl<R: Read> Vp8Decoder<R> {
                 }
 
                 c => panic!("unknown token: {}", c),
-            });
+            };
+            debug_assert!(abs_value >= 0);
 
             skip = false;
 
-            complexity = if abs_value == 0 {
-                0
-            } else if abs_value == 1 {
-                1
-            } else {
-                2
-            };
+            complexity = (abs_value as u16 as usize).min(2);
 
             if reader.read_flag().or_accumulate(&mut res) {
                 abs_value = -abs_value;
@@ -1712,7 +1708,9 @@ impl<R: Read> Vp8Decoder<R> {
             let zigzag = ZIGZAG[i] as usize;
             let r = zigzag / 4;
             let c = zigzag % 4;
-            block[r][c] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
+            let cq: i16 = if zigzag > 0 { acq } else { dcq };
+            let value = abs_value * cq;
+            block[r][c] = i32::from(value);
 
             has_coefficients = true;
         }
