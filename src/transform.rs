@@ -1,5 +1,5 @@
-static CONST1: i64 = 20091;
-static CONST2: i64 = 35468;
+const CONST1: i64 = 20091;
+const CONST2: i64 = 35468;
 
 pub(crate) fn idct4x4(block: &mut [i32]) {
     // The intermediate results may overflow the types, so we stretch the type.

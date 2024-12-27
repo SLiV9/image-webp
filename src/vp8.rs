@@ -699,12 +699,12 @@ const DCT_CAT5: i8 = 9;
 const DCT_CAT6: i8 = 10;
 const DCT_EOB: i8 = 11;
 
-static DCT_TOKEN_TREE: [i8; 22] = [
+const DCT_TOKEN_TREE: [i8; 22] = [
     -DCT_EOB, 2, -DCT_0, 4, -DCT_1, 6, 8, 12, -DCT_2, 10, -DCT_3, -DCT_4, 14, 16, -DCT_CAT1,
     -DCT_CAT2, 18, 20, -DCT_CAT3, -DCT_CAT4, -DCT_CAT5, -DCT_CAT6,
 ];
 
-static PROB_DCT_CAT: [[Prob; 12]; 6] = [
+const PROB_DCT_CAT: [[Prob; 12]; 6] = [
     [159, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     [165, 145, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     [173, 148, 140, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -713,11 +713,11 @@ static PROB_DCT_CAT: [[Prob; 12]; 6] = [
     [254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129, 0],
 ];
 
-static DCT_CAT_BASE: [u8; 6] = [5, 7, 11, 19, 35, 67];
-static COEFF_BANDS: [u8; 16] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7];
+const DCT_CAT_BASE: [u8; 6] = [5, 7, 11, 19, 35, 67];
+const COEFF_BANDS: [u8; 16] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7];
 
 #[rustfmt::skip]
-static DC_QUANT: [i16; 128] = [
+const DC_QUANT: [i16; 128] = [
       4,   5,   6,   7,   8,   9,  10,  10,
      11,  12,  13,  14,  15,  16,  17,  17,
      18,  19,  20,  20,  21,  21,  22,  22,
@@ -737,7 +737,7 @@ static DC_QUANT: [i16; 128] = [
 ];
 
 #[rustfmt::skip]
-static AC_QUANT: [i16; 128] = [
+const AC_QUANT: [i16; 128] = [
       4,   5,   6,   7,   8,    9,  10,  11,
       12,  13,  14,  15,  16,  17,  18,  19,
       20,  21,  22,  23,  24,  25,  26,  27,
@@ -756,7 +756,7 @@ static AC_QUANT: [i16; 128] = [
      249, 254, 259, 264, 269, 274, 279, 284,
 ];
 
-static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+const ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
 #[derive(Default, Clone, Copy)]
 struct MacroBlock {
