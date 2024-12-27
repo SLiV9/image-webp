@@ -2,6 +2,41 @@ use crate::decoder::DecodingError;
 
 use super::vp8::TreeNode;
 
+#[must_use]
+#[repr(transparent)]
+pub(crate) struct BitResult<T> {
+    value_if_not_past_eof: T,
+}
+
+#[must_use]
+pub(crate) struct BitResultAccumulator;
+
+impl BitResult<()> {
+    pub(crate) const OK: BitResultAccumulator = BitResultAccumulator;
+}
+
+impl<T> BitResult<T> {
+    const fn ok(value: T) -> Self {
+        Self {
+            value_if_not_past_eof: value,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn or_accumulate(self, acc: &mut BitResultAccumulator) -> T {
+        let _ = acc;
+        self.value_if_not_past_eof
+    }
+}
+
+impl<T: Default> BitResult<T> {
+    fn err() -> Self {
+        Self {
+            value_if_not_past_eof: T::default(),
+        }
+    }
+}
+
 #[cfg_attr(test, derive(Debug))]
 pub(crate) struct BoolReader {
     chunks: Box<[[u8; 4]]>,
@@ -38,7 +73,7 @@ impl BoolReader {
             chunks: Box::new([]),
             state,
             final_bytes: [0; 3],
-            final_bytes_remaining: -1,
+            final_bytes_remaining: Self::FINAL_BYTES_REMAINING_EOF,
         }
     }
 
@@ -47,9 +82,10 @@ impl BoolReader {
         let final_bytes_remaining = if len == 4 * buf.len() {
             0
         } else {
-            debug_assert!(len < 4 * buf.len());
             // Pop the last chunk (which is partial), then get length.
-            let last_chunk = buf.pop().unwrap();
+            let Some(last_chunk) = buf.pop() else {
+                return Err(DecodingError::NotEnoughInitData);
+            };
             let len_rounded_down = 4 * buf.len();
             let num_bytes_popped = len - len_rounded_down;
             debug_assert!(num_bytes_popped <= 3);
@@ -78,16 +114,60 @@ impl BoolReader {
         Ok(())
     }
 
-    fn fast<'a>(&'a mut self) -> FastReader<'a> {
-        FastReader {
-            chunks: &self.chunks,
-            uncommitted_state: self.state,
-            save_state: &mut self.state,
+    #[inline(always)]
+    pub(crate) fn check<T>(
+        &self,
+        acc: BitResultAccumulator,
+        value_if_not_past_eof: T,
+    ) -> Result<T, DecodingError> {
+        let _ = acc;
+        if self.is_past_eof() {
+            Err(DecodingError::BitStreamError)
+        } else {
+            Ok(value_if_not_past_eof)
         }
     }
 
+    #[inline(always)]
+    pub(crate) fn check_directly<T>(&self, result: BitResult<T>) -> Result<T, DecodingError> {
+        let mut acc = BitResult::OK;
+        let value = result.or_accumulate(&mut acc);
+        self.check(acc, value)
+    }
+
+    fn accumulated<T>(&self, acc: BitResultAccumulator, value_if_not_past_eof: T) -> BitResult<T> {
+        let _ = acc;
+        BitResult::ok(value_if_not_past_eof)
+    }
+
+    const FINAL_BYTES_REMAINING_EOF: i8 = -0xE;
+
     #[cold]
-    fn cold_read_bit(&mut self, probability: u8) -> Result<bool, DecodingError> {
+    fn load_final_bytes(&mut self) {
+        if self.final_bytes_remaining > 0 {
+            self.final_bytes_remaining -= 1;
+            let byte = self.final_bytes[0];
+            self.final_bytes.rotate_left(1);
+            self.state.value <<= 8;
+            self.state.value |= u64::from(byte);
+            self.state.bit_count += 8;
+        } else if self.final_bytes_remaining == 0 {
+            // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
+            // This replicates that logic.
+            self.final_bytes_remaining -= 1;
+            self.state.value <<= 8;
+            self.state.bit_count += 8;
+        } else {
+            self.final_bytes_remaining = Self::FINAL_BYTES_REMAINING_EOF;
+        }
+    }
+
+    fn is_past_eof(&self) -> bool {
+        self.final_bytes_remaining == Self::FINAL_BYTES_REMAINING_EOF
+    }
+
+    #[cold]
+    fn cold_read_bit(&mut self, probability: u8) -> BitResult<bool> {
         if self.state.bit_count < 0 {
             if let Some(chunk) = self.chunks.get(self.state.chunk_index).copied() {
                 let v = u32::from_be_bytes(chunk);
@@ -96,7 +176,10 @@ impl BoolReader {
                 self.state.value |= u64::from(v);
                 self.state.bit_count += 32;
             } else {
-                self.load_final_bytes()?;
+                self.load_final_bytes();
+                if self.is_past_eof() {
+                    return BitResult::err();
+                }
             }
         }
         debug_assert!(self.state.bit_count >= 0);
@@ -125,35 +208,21 @@ impl BoolReader {
         self.state.bit_count -= shift as i32;
         debug_assert!(self.state.range >= 128);
 
-        Ok(retval)
+        BitResult::ok(retval)
     }
 
-    #[cold]
-    fn load_final_bytes(&mut self) -> Result<(), DecodingError> {
-        if self.final_bytes_remaining > 0 {
-            self.final_bytes_remaining -= 1;
-            let byte = self.final_bytes[0];
-            self.final_bytes.rotate_left(1);
-            self.state.value <<= 8;
-            self.state.value |= u64::from(byte);
-            self.state.bit_count += 8;
-            Ok(())
-        } else if self.final_bytes_remaining == 0 {
-            // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
-            // This replicates that logic.
-            self.final_bytes_remaining -= 1;
-            self.state.value <<= 8;
-            self.state.bit_count += 8;
-            Ok(())
-        } else {
-            Err(DecodingError::BitStreamError)
+    fn fast<'a>(&'a mut self) -> FastReader<'a> {
+        FastReader {
+            chunks: &self.chunks,
+            uncommitted_state: self.state,
+            save_state: &mut self.state,
         }
     }
 
     #[inline(never)]
-    pub(crate) fn read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
+    pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
         if let Some(b) = self.fast().read_bit(probability) {
-            return Ok(b);
+            return BitResult::ok(b);
         }
 
         self.cold_read_bool(probability)
@@ -161,14 +230,14 @@ impl BoolReader {
 
     #[cold]
     #[inline(never)]
-    fn cold_read_bool(&mut self, probability: u8) -> Result<bool, DecodingError> {
+    fn cold_read_bool(&mut self, probability: u8) -> BitResult<bool> {
         self.cold_read_bit(probability)
     }
 
     #[inline(never)]
-    pub(crate) fn read_literal(&mut self, n: u8) -> Result<u8, DecodingError> {
+    pub(crate) fn read_literal(&mut self, n: u8) -> BitResult<u8> {
         if let Some(v) = self.fast().read_literal(n) {
-            return Ok(v);
+            return BitResult::ok(v);
         }
 
         self.cold_read_literal(n)
@@ -176,21 +245,22 @@ impl BoolReader {
 
     #[cold]
     #[inline(never)]
-    fn cold_read_literal(&mut self, n: u8) -> Result<u8, DecodingError> {
+    fn cold_read_literal(&mut self, n: u8) -> BitResult<u8> {
         let mut v = 0u8;
+        let mut res = BitResult::OK;
 
         for _ in 0..n {
-            let b = self.cold_read_bit(128)?;
+            let b = self.cold_read_bit(128).or_accumulate(&mut res);
             v = (v << 1) + b as u8;
         }
 
-        Ok(v)
+        self.accumulated(res, v)
     }
 
     #[inline(never)]
-    pub(crate) fn read_optional_signed_value(&mut self, n: u8) -> Result<i32, DecodingError> {
+    pub(crate) fn read_optional_signed_value(&mut self, n: u8) -> BitResult<i32> {
         if let Some(v) = self.fast().read_optional_signed_value(n) {
-            return Ok(v);
+            return BitResult::ok(v);
         }
 
         self.cold_read_optional_signed_value(n)
@@ -198,28 +268,26 @@ impl BoolReader {
 
     #[cold]
     #[inline(never)]
-    fn cold_read_optional_signed_value(&mut self, n: u8) -> Result<i32, DecodingError> {
-        let flag = self.cold_read_bool(128)?;
+    fn cold_read_optional_signed_value(&mut self, n: u8) -> BitResult<i32> {
+        let mut res = BitResult::OK;
+        let flag = self.cold_read_bool(128).or_accumulate(&mut res);
         if !flag {
             // We should not read further bits if the flag is not set.
-            return Ok(0);
+            return self.accumulated(res, 0);
         }
-        let magnitude = self.cold_read_literal(n)?;
-        let sign = self.cold_read_bool(128)?;
+        let magnitude = self.cold_read_literal(n).or_accumulate(&mut res);
+        let sign = self.cold_read_bool(128).or_accumulate(&mut res);
 
         let value = if sign {
             -i32::from(magnitude)
         } else {
             i32::from(magnitude)
         };
-        Ok(value)
+        self.accumulated(res, value)
     }
 
     #[inline]
-    pub(crate) fn read_with_tree<const N: usize>(
-        &mut self,
-        tree: &[TreeNode; N],
-    ) -> Result<i8, DecodingError> {
+    pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {
         let first_node = tree[0];
         self.read_with_tree_with_first_node(tree, first_node)
     }
@@ -229,39 +297,36 @@ impl BoolReader {
         &mut self,
         tree: &[TreeNode],
         first_node: TreeNode,
-    ) -> Result<i8, DecodingError> {
+    ) -> BitResult<i8> {
         if let Some(v) = self.fast().read_with_tree(tree, first_node) {
-            return Ok(v);
+            return BitResult::ok(v);
         }
 
         self.cold_read_with_tree(tree, usize::from(first_node.index))
     }
 
     #[cold]
-    fn cold_read_with_tree(
-        &mut self,
-        tree: &[TreeNode],
-        start: usize,
-    ) -> Result<i8, DecodingError> {
+    fn cold_read_with_tree(&mut self, tree: &[TreeNode], start: usize) -> BitResult<i8> {
         let mut index = start;
+        let mut res = BitResult::OK;
 
         loop {
             let node = tree[index];
             let prob = node.prob;
-            let b = self.cold_read_bit(prob)?;
+            let b = self.cold_read_bit(prob).or_accumulate(&mut res);
             let t = if b { node.right } else { node.left };
             let new_index = usize::from(t);
             if new_index < tree.len() {
                 index = new_index;
             } else {
                 let value = TreeNode::value_from_branch(t);
-                return Ok(value);
+                return self.accumulated(res, value);
             }
         }
     }
 
     #[inline]
-    pub(crate) fn read_flag(&mut self) -> Result<bool, DecodingError> {
+    pub(crate) fn read_flag(&mut self) -> BitResult<bool> {
         self.read_bool(128)
     }
 }
@@ -392,45 +457,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bool_reader_hello_short() -> Result<(), DecodingError> {
+    fn test_bool_reader_hello_short() {
         let mut reader = BoolReader::new();
         let data = b"hel";
         let size = data.len();
         let mut buf = vec![[0u8; 4]; 1];
         buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
         reader.init(buf, size).unwrap();
-        assert_eq!(false, reader.read_bool(128)?);
-        assert_eq!(true, reader.read_bool(10)?);
-        assert_eq!(false, reader.read_bool(250)?);
-        assert_eq!(1, reader.read_literal(1)?);
-        assert_eq!(5, reader.read_literal(3)?);
-        assert_eq!(64, reader.read_literal(8)?);
-        assert_eq!(185, reader.read_literal(8)?);
-        Ok(())
+        let mut res = BitResult::OK;
+        assert_eq!(false, reader.read_bool(128).or_accumulate(&mut res));
+        assert_eq!(true, reader.read_bool(10).or_accumulate(&mut res));
+        assert_eq!(false, reader.read_bool(250).or_accumulate(&mut res));
+        assert_eq!(1, reader.read_literal(1).or_accumulate(&mut res));
+        assert_eq!(5, reader.read_literal(3).or_accumulate(&mut res));
+        assert_eq!(64, reader.read_literal(8).or_accumulate(&mut res));
+        assert_eq!(185, reader.read_literal(8).or_accumulate(&mut res));
+        reader.check(res, ()).unwrap();
     }
 
     #[test]
-    fn test_bool_reader_hello_long() -> Result<(), DecodingError> {
+    fn test_bool_reader_hello_long() {
         let mut reader = BoolReader::new();
         let data = b"hello world";
         let size = data.len();
         let mut buf = vec![[0u8; 4]; (size + 3) / 4];
         buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
         reader.init(buf, size).unwrap();
-        assert_eq!(false, reader.read_bool(128)?);
-        assert_eq!(true, reader.read_bool(10)?);
-        assert_eq!(false, reader.read_bool(250)?);
-        assert_eq!(1, reader.read_literal(1)?);
-        assert_eq!(5, reader.read_literal(3)?);
-        assert_eq!(64, reader.read_literal(8)?);
-        assert_eq!(185, reader.read_literal(8)?);
-        assert_eq!(31, reader.read_literal(8)?);
-        Ok(())
+        let mut res = BitResult::OK;
+        assert_eq!(false, reader.read_bool(128).or_accumulate(&mut res));
+        assert_eq!(true, reader.read_bool(10).or_accumulate(&mut res));
+        assert_eq!(false, reader.read_bool(250).or_accumulate(&mut res));
+        assert_eq!(1, reader.read_literal(1).or_accumulate(&mut res));
+        assert_eq!(5, reader.read_literal(3).or_accumulate(&mut res));
+        assert_eq!(64, reader.read_literal(8).or_accumulate(&mut res));
+        assert_eq!(185, reader.read_literal(8).or_accumulate(&mut res));
+        assert_eq!(31, reader.read_literal(8).or_accumulate(&mut res));
+        reader.check(res, ()).unwrap();
     }
 
     #[test]
     fn test_bool_reader_uninit() {
         let mut reader = BoolReader::new();
-        assert!(reader.read_flag().is_err());
+        let mut res = BitResult::OK;
+        let _ = reader.read_flag().or_accumulate(&mut res);
+        let result = reader.check(res, ());
+        assert!(result.is_err());
     }
 }
