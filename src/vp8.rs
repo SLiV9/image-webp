@@ -1388,22 +1388,21 @@ impl<R: Read> Vp8Decoder<R> {
 
     fn read_macroblock_header(&mut self, mbx: usize) -> Result<MacroBlock, DecodingError> {
         let mut mb = MacroBlock::default();
+        let mut res = BitResult::OK;
 
         if self.segments_enabled && self.segments_update_map {
-            let res = self.b.read_with_tree(&self.segment_tree_nodes);
-            mb.segmentid = self.b.check_directly(res)? as u8;
+            mb.segmentid =
+                (self.b.read_with_tree(&self.segment_tree_nodes)).or_accumulate(&mut res) as u8;
         };
 
         mb.coeffs_skipped = if let Some(prob) = self.prob_skip_false {
-            let res = self.b.read_bool(prob);
-            self.b.check_directly(res)?
+            self.b.read_bool(prob).or_accumulate(&mut res)
         } else {
             false
         };
 
         let inter_predicted = if !self.frame.keyframe {
-            let res = self.b.read_bool(self.prob_intra);
-            self.b.check_directly(res)?
+            self.b.read_bool(self.prob_intra).or_accumulate(&mut res)
         } else {
             false
         };
@@ -1416,8 +1415,7 @@ impl<R: Read> Vp8Decoder<R> {
 
         if self.frame.keyframe {
             // intra prediction
-            let res = self.b.read_with_tree(&KEYFRAME_YMODE_NODES);
-            let luma = self.b.check_directly(res)?;
+            let luma = (self.b.read_with_tree(&KEYFRAME_YMODE_NODES)).or_accumulate(&mut res);
             mb.luma_mode =
                 LumaMode::from_i8(luma).ok_or(DecodingError::LumaPredictionModeInvalid(luma))?;
 
@@ -1428,10 +1426,10 @@ impl<R: Read> Vp8Decoder<R> {
                         for x in 0usize..4 {
                             let top = self.top[mbx].bpred[12 + x];
                             let left = self.left.bpred[y];
-                            let res = self.b.read_with_tree(
+                            let intra = self.b.read_with_tree(
                                 &KEYFRAME_BPRED_MODE_NODES[top as usize][left as usize],
                             );
-                            let intra = self.b.check_directly(res)?;
+                            let intra = intra.or_accumulate(&mut res);
                             let bmode = IntraMode::from_i8(intra)
                                 .ok_or(DecodingError::IntraPredictionModeInvalid(intra))?;
                             mb.bpred[x + y * 4] = bmode;
@@ -1449,8 +1447,7 @@ impl<R: Read> Vp8Decoder<R> {
                 }
             }
 
-            let res = self.b.read_with_tree(&KEYFRAME_UV_MODE_NODES);
-            let chroma = self.b.check_directly(res)?;
+            let chroma = (self.b.read_with_tree(&KEYFRAME_UV_MODE_NODES)).or_accumulate(&mut res);
             mb.chroma_mode = ChromaMode::from_i8(chroma)
                 .ok_or(DecodingError::ChromaPredictionModeInvalid(chroma))?;
         }
@@ -1459,7 +1456,7 @@ impl<R: Read> Vp8Decoder<R> {
         self.top[mbx].luma_mode = mb.luma_mode;
         self.top[mbx].bpred = mb.bpred;
 
-        Ok(mb)
+        self.b.check(res, mb)
     }
 
     fn intra_predict_luma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &[i32]) {

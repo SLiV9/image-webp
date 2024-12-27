@@ -22,6 +22,8 @@ impl<T> BitResult<T> {
         }
     }
 
+    /// Instead of checking this result now, accumulate the burden of checking
+    /// into an accumulator. This accumulator must be checked in the end.
     #[inline(always)]
     pub(crate) fn or_accumulate(self, acc: &mut BitResultAccumulator) -> T {
         let _ = acc;
@@ -89,9 +91,7 @@ impl BoolReader {
             let len_rounded_down = 4 * buf.len();
             let num_bytes_popped = len - len_rounded_down;
             debug_assert!(num_bytes_popped <= 3);
-            for i in 0..num_bytes_popped {
-                final_bytes[i] = last_chunk[i];
-            }
+            final_bytes[..num_bytes_popped].copy_from_slice(&last_chunk[..num_bytes_popped]);
             for i in num_bytes_popped..4 {
                 debug_assert_eq!(last_chunk[i], 0, "unexpected {last_chunk:?}");
             }
@@ -128,13 +128,6 @@ impl BoolReader {
         }
     }
 
-    #[inline(always)]
-    pub(crate) fn check_directly<T>(&self, result: BitResult<T>) -> Result<T, DecodingError> {
-        let mut acc = BitResult::OK;
-        let value = result.or_accumulate(&mut acc);
-        self.check(acc, value)
-    }
-
     fn accumulated<T>(&self, acc: BitResultAccumulator, value_if_not_past_eof: T) -> BitResult<T> {
         let _ = acc;
         BitResult::ok(value_if_not_past_eof)
@@ -142,23 +135,26 @@ impl BoolReader {
 
     const FINAL_BYTES_REMAINING_EOF: i8 = -0xE;
 
-    #[cold]
-    fn load_final_bytes(&mut self) {
-        if self.final_bytes_remaining > 0 {
-            self.final_bytes_remaining -= 1;
-            let byte = self.final_bytes[0];
-            self.final_bytes.rotate_left(1);
-            self.state.value <<= 8;
-            self.state.value |= u64::from(byte);
-            self.state.bit_count += 8;
-        } else if self.final_bytes_remaining == 0 {
-            // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
-            // This replicates that logic.
-            self.final_bytes_remaining -= 1;
-            self.state.value <<= 8;
-            self.state.bit_count += 8;
-        } else {
-            self.final_bytes_remaining = Self::FINAL_BYTES_REMAINING_EOF;
+    fn load_from_final_bytes(&mut self) {
+        match self.final_bytes_remaining {
+            1.. => {
+                self.final_bytes_remaining -= 1;
+                let byte = self.final_bytes[0];
+                self.final_bytes.rotate_left(1);
+                self.state.value <<= 8;
+                self.state.value |= u64::from(byte);
+                self.state.bit_count += 8;
+            }
+            0 => {
+                // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
+                // This replicates that logic.
+                self.final_bytes_remaining -= 1;
+                self.state.value <<= 8;
+                self.state.bit_count += 8;
+            }
+            _ => {
+                self.final_bytes_remaining = Self::FINAL_BYTES_REMAINING_EOF;
+            }
         }
     }
 
@@ -166,7 +162,6 @@ impl BoolReader {
         self.final_bytes_remaining == Self::FINAL_BYTES_REMAINING_EOF
     }
 
-    #[cold]
     fn cold_read_bit(&mut self, probability: u8) -> BitResult<bool> {
         if self.state.bit_count < 0 {
             if let Some(chunk) = self.chunks.get(self.state.chunk_index).copied() {
@@ -176,7 +171,7 @@ impl BoolReader {
                 self.state.value |= u64::from(v);
                 self.state.bit_count += 32;
             } else {
-                self.load_final_bytes();
+                self.load_from_final_bytes();
                 if self.is_past_eof() {
                     return BitResult::err();
                 }
@@ -211,7 +206,7 @@ impl BoolReader {
         BitResult::ok(retval)
     }
 
-    fn fast<'a>(&'a mut self) -> FastReader<'a> {
+    fn fast(&mut self) -> FastReader<'_> {
         FastReader {
             chunks: &self.chunks,
             uncommitted_state: self.state,
@@ -286,12 +281,14 @@ impl BoolReader {
         self.accumulated(res, value)
     }
 
+    // This is inlined and generic just to skip the first bounds check.
     #[inline]
     pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {
         let first_node = tree[0];
         self.read_with_tree_with_first_node(tree, first_node)
     }
 
+    // Do not inline this function because inlining it worsens performance.
     #[inline(never)]
     pub(crate) fn read_with_tree_with_first_node(
         &mut self,
@@ -306,6 +303,7 @@ impl BoolReader {
     }
 
     #[cold]
+    #[inline(never)]
     fn cold_read_with_tree(&mut self, tree: &[TreeNode], start: usize) -> BitResult<i8> {
         let mut index = start;
         let mut res = BitResult::OK;
@@ -331,7 +329,7 @@ impl BoolReader {
     }
 }
 
-impl<'a> FastReader<'a> {
+impl FastReader<'_> {
     fn commit_if_valid<T>(self, value_if_not_past_eof: T) -> Option<T> {
         // If `chunk_index > self.chunks.len()`, it means we used zeroes
         // instead of an actual chunk and `value_if_not_past_eof` is nonsense.
