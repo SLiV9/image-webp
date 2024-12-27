@@ -332,8 +332,9 @@ impl BoolReader {
 }
 
 impl<'a> FastReader<'a> {
-    fn commit_if_valid<T>(self, acc: BitResultAccumulator, value_if_not_past_eof: T) -> Option<T> {
-        let _ = acc;
+    fn commit_if_valid<T>(self, value_if_not_past_eof: T) -> Option<T> {
+        // If `chunk_index > self.chunks.len()`, it means we used zeroes
+        // instead of an actual chunk and `value_if_not_past_eof` is nonsense.
         if self.uncommitted_state.chunk_index <= self.chunks.len() {
             *self.save_state = self.uncommitted_state;
             Some(value_if_not_past_eof)
@@ -343,41 +344,37 @@ impl<'a> FastReader<'a> {
     }
 
     fn read_bit(mut self, probability: u8) -> Option<bool> {
-        let mut res = BitResult::OK;
-        let bit = self.fast_read_bit(probability, &mut res);
-        self.commit_if_valid(res, bit)
+        let bit = self.fast_read_bit(probability);
+        self.commit_if_valid(bit)
     }
 
     fn read_literal(mut self, n: u8) -> Option<u8> {
-        let mut res = BitResult::OK;
-        let value = self.fast_read_literal(n, &mut res);
-        self.commit_if_valid(res, value)
+        let value = self.fast_read_literal(n);
+        self.commit_if_valid(value)
     }
 
     fn read_optional_signed_value(mut self, n: u8) -> Option<i32> {
-        let mut res = BitResult::OK;
-        let flag = self.fast_read_bit(128, &mut res);
+        let flag = self.fast_read_bit(128);
         if !flag {
             // We should not read further bits if the flag is not set.
-            return self.commit_if_valid(res, 0);
+            return self.commit_if_valid(0);
         }
-        let magnitude = self.fast_read_literal(n, &mut res);
-        let sign = self.fast_read_bit(128, &mut res);
+        let magnitude = self.fast_read_literal(n);
+        let sign = self.fast_read_bit(128);
         let value = if sign {
             -i32::from(magnitude)
         } else {
             i32::from(magnitude)
         };
-        self.commit_if_valid(res, value)
+        self.commit_if_valid(value)
     }
 
     fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {
-        let mut res = BitResult::OK;
-        let value = self.fast_read_with_tree(tree, first_node, &mut res);
-        self.commit_if_valid(res, value)
+        let value = self.fast_read_with_tree(tree, first_node);
+        self.commit_if_valid(value)
     }
 
-    fn fast_read_bit(&mut self, probability: u8, acc: &mut BitResultAccumulator) -> bool {
+    fn fast_read_bit(&mut self, probability: u8) -> bool {
         let State {
             mut chunk_index,
             mut value,
@@ -386,11 +383,12 @@ impl<'a> FastReader<'a> {
         } = self.uncommitted_state;
 
         if bit_count < 0 {
-            let chunk = match self.chunks.get(chunk_index).copied() {
-                Some(chunk) => BitResult::ok(chunk),
-                None => BitResult::err(),
-            };
-            let chunk = chunk.or_accumulate(acc);
+            let chunk = self.chunks.get(chunk_index).copied();
+            // We ignore invalid data inside the `fast_` functions,
+            // but we increase `chunk_index` below, so we can check
+            // whether we read invalid data in `commit_if_valid`.
+            let chunk = chunk.unwrap_or_default();
+
             let v = u32::from_be_bytes(chunk);
             chunk_index += 1;
             value <<= 32;
@@ -432,24 +430,19 @@ impl<'a> FastReader<'a> {
         retval
     }
 
-    fn fast_read_literal(&mut self, n: u8, acc: &mut BitResultAccumulator) -> u8 {
+    fn fast_read_literal(&mut self, n: u8) -> u8 {
         let mut v = 0u8;
         for _ in 0..n {
-            let b = self.fast_read_bit(128, acc);
+            let b = self.fast_read_bit(128);
             v = (v << 1) + b as u8;
         }
         v
     }
 
-    fn fast_read_with_tree(
-        &mut self,
-        tree: &[TreeNode],
-        mut node: TreeNode,
-        acc: &mut BitResultAccumulator,
-    ) -> i8 {
+    fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {
         loop {
             let prob = node.prob;
-            let b = self.fast_read_bit(prob, acc);
+            let b = self.fast_read_bit(prob);
             let i = if b { node.right } else { node.left };
             let Some(next_node) = tree.get(usize::from(i)) else {
                 return TreeNode::value_from_branch(i);
