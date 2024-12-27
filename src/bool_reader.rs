@@ -279,17 +279,26 @@ impl BoolReader {
         self.accumulated(res, value)
     }
 
-    pub(crate) fn read_with_tree(&mut self, tree: &[TreeNode], skip: bool) -> BitResult<i8> {
-        if let Some(v) = self.fast().read_with_tree(tree, skip) {
+    pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {
+        let first_node = tree[0];
+        self.read_with_tree_with_first_node(tree, first_node)
+    }
+
+    pub(crate) fn read_with_tree_with_first_node(
+        &mut self,
+        tree: &[TreeNode],
+        first_node: TreeNode,
+    ) -> BitResult<i8> {
+        if let Some(v) = self.fast().read_with_tree(tree, first_node) {
             return BitResult::ok(v);
         }
 
-        self.cold_read_with_tree(tree, skip)
+        self.cold_read_with_tree(tree, usize::from(first_node.index))
     }
 
     #[cold]
-    fn cold_read_with_tree(&mut self, tree: &[TreeNode], skip: bool) -> BitResult<i8> {
-        let mut index = skip as usize;
+    fn cold_read_with_tree(&mut self, tree: &[TreeNode], start: usize) -> BitResult<i8> {
+        let mut index = start;
         let mut res = BitResult::OK;
 
         loop {
@@ -341,9 +350,9 @@ impl<'a> FastReader<'a> {
         self.commit_if_valid(res, b)
     }
 
-    fn read_with_tree(mut self, tree: &[TreeNode], skip: bool) -> Option<i8> {
+    fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {
         let mut res = BitResult::OK;
-        let b = self.fast_read_with_tree(tree, skip, &mut res);
+        let b = self.fast_read_with_tree(tree, first_node, &mut res);
         self.commit_if_valid(res, b)
     }
 
@@ -423,16 +432,18 @@ impl<'a> FastReader<'a> {
     fn fast_read_with_tree(
         &mut self,
         tree: &[TreeNode],
-        skip: bool,
+        mut node: TreeNode,
         acc: &mut BitResultAccumulator,
     ) -> i8 {
-        let mut i = skip as u8;
-        while let Some(node) = tree.get(usize::from(i)) {
+        loop {
             let prob = u32::from(node.prob);
             let b = self.fast_read_bit(prob, acc);
-            i = if b { node.right } else { node.left };
+            let i = if b { node.right } else { node.left };
+            let Some(next_node) = tree.get(usize::from(i)) else {
+                return TreeNode::value_from_branch(i);
+            };
+            node = *next_node;
         }
-        TreeNode::value_from_branch(i)
     }
 }
 
