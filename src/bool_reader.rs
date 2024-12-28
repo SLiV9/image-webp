@@ -11,10 +11,6 @@ pub(crate) struct BitResult<T> {
 #[must_use]
 pub(crate) struct BitResultAccumulator;
 
-impl BitResult<()> {
-    pub(crate) const OK: BitResultAccumulator = BitResultAccumulator;
-}
-
 impl<T> BitResult<T> {
     const fn ok(value: T) -> Self {
         Self {
@@ -114,13 +110,32 @@ impl BoolReader {
         Ok(())
     }
 
+    /// Start a span of reading operations from the buffer, without stopping
+    /// when the buffer runs out. For all valid webp images, the buffer will not
+    /// run out prematurely. Conversely if the buffer ends early, the webp image
+    /// cannot be correctly decoded and any intermediate results need to be
+    /// discarded anyway.
+    ///
+    /// Each call to `start_accumulated_result` must be followed by a call to
+    /// `check` on the *same* `BoolReader`.
+    #[inline(always)]
+    pub(crate) fn start_accumulated_result(&mut self) -> BitResultAccumulator {
+        BitResultAccumulator
+    }
+
+    /// Check that the read operations done so far were all valid.
     #[inline(always)]
     pub(crate) fn check<T>(
         &self,
         acc: BitResultAccumulator,
         value_if_not_past_eof: T,
     ) -> Result<T, DecodingError> {
-        let _ = acc;
+        // The accumulator does not store any state because doing so is
+        // too computationally expensive. Passing it around is a bit of
+        // formality (that is optimized out) to ensure we call `check` .
+        // Instead we check whether we have read past the end of the file.
+        let BitResultAccumulator = acc;
+
         if self.is_past_eof() {
             Err(DecodingError::BitStreamError)
         } else {
@@ -128,9 +143,94 @@ impl BoolReader {
         }
     }
 
-    fn accumulated<T>(&self, acc: BitResultAccumulator, value_if_not_past_eof: T) -> BitResult<T> {
-        let _ = acc;
+    fn keep_accumulating<T>(
+        &self,
+        acc: BitResultAccumulator,
+        value_if_not_past_eof: T,
+    ) -> BitResult<T> {
+        // The BitResult will be checked later by a different accumulator.
+        // Because it does not carry state, that is fine.
+        let BitResultAccumulator = acc;
+
         BitResult::ok(value_if_not_past_eof)
+    }
+
+    // Do not inline this because inlining seems to worsen performance.
+    #[inline(never)]
+    pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
+        if let Some(b) = self.fast().read_bit(probability) {
+            return BitResult::ok(b);
+        }
+
+        self.cold_read_bool(probability)
+    }
+
+    // Do not inline this because inlining seems to worsen performance.
+    #[inline(never)]
+    pub(crate) fn read_literal(&mut self, n: u8) -> BitResult<u8> {
+        if let Some(v) = self.fast().read_literal(n) {
+            return BitResult::ok(v);
+        }
+
+        self.cold_read_literal(n)
+    }
+
+    // Do not inline this because inlining seems to worsen performance.
+    #[inline(never)]
+    pub(crate) fn read_optional_signed_value(&mut self, n: u8) -> BitResult<i32> {
+        if let Some(v) = self.fast().read_optional_signed_value(n) {
+            return BitResult::ok(v);
+        }
+
+        self.cold_read_optional_signed_value(n)
+    }
+
+    // This is generic and inlined just to skip the first bounds check.
+    #[inline]
+    pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {
+        let first_node = tree[0];
+        self.read_with_tree_with_first_node(tree, first_node)
+    }
+
+    // Do not inline this because inlining significantly worsens performance.
+    #[inline(never)]
+    pub(crate) fn read_with_tree_with_first_node(
+        &mut self,
+        tree: &[TreeNode],
+        first_node: TreeNode,
+    ) -> BitResult<i8> {
+        if let Some(v) = self.fast().read_with_tree(tree, first_node) {
+            return BitResult::ok(v);
+        }
+
+        self.cold_read_with_tree(tree, usize::from(first_node.index))
+    }
+
+    // This should be inlined to allow it to share the instruction cache with
+    // `read_bool`, as both functions are short and called often.
+    #[inline]
+    pub(crate) fn read_flag(&mut self) -> BitResult<bool> {
+        self.read_bool(128)
+    }
+
+    // As a similar (but different) speedup to BitResult, the FastReader reads
+    // bits under an assumption and validates it at the end.
+    //
+    // The idea here is that for normal-sized webp images, the vast majority
+    // of bits are somewhere other than in the last four bytes. Therefore we
+    // can pretend the buffer has infinite size. After we are done reading,
+    // we check if we actually read past the end of `self.chunks`.
+    // If so, we backtrack (or rather we discard `uncommitted_state`)
+    // and try again with the slow approach. This might result in doing double
+    // work for those last few bytes -- in fact we even keep retrying the fast
+    // method to save an if-statement --, but more than make up for that by
+    // speeding up reading from the other thousands or millions of bytes.
+    fn fast(&mut self) -> FastReader<'_> {
+        FastReader {
+            chunks: &self.chunks,
+            uncommitted_state: self.state,
+            save_state: &mut self.state,
+        }
     }
 
     const FINAL_BYTES_REMAINING_EOF: i8 = -0xE;
@@ -206,69 +306,34 @@ impl BoolReader {
         BitResult::ok(retval)
     }
 
-    fn fast(&mut self) -> FastReader<'_> {
-        FastReader {
-            chunks: &self.chunks,
-            uncommitted_state: self.state,
-            save_state: &mut self.state,
-        }
-    }
-
-    #[inline(never)]
-    pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
-        if let Some(b) = self.fast().read_bit(probability) {
-            return BitResult::ok(b);
-        }
-
-        self.cold_read_bool(probability)
-    }
-
     #[cold]
     #[inline(never)]
     fn cold_read_bool(&mut self, probability: u8) -> BitResult<bool> {
         self.cold_read_bit(probability)
     }
 
-    #[inline(never)]
-    pub(crate) fn read_literal(&mut self, n: u8) -> BitResult<u8> {
-        if let Some(v) = self.fast().read_literal(n) {
-            return BitResult::ok(v);
-        }
-
-        self.cold_read_literal(n)
-    }
-
     #[cold]
     #[inline(never)]
     fn cold_read_literal(&mut self, n: u8) -> BitResult<u8> {
         let mut v = 0u8;
-        let mut res = BitResult::OK;
+        let mut res = self.start_accumulated_result();
 
         for _ in 0..n {
             let b = self.cold_read_bit(128).or_accumulate(&mut res);
             v = (v << 1) + b as u8;
         }
 
-        self.accumulated(res, v)
-    }
-
-    #[inline(never)]
-    pub(crate) fn read_optional_signed_value(&mut self, n: u8) -> BitResult<i32> {
-        if let Some(v) = self.fast().read_optional_signed_value(n) {
-            return BitResult::ok(v);
-        }
-
-        self.cold_read_optional_signed_value(n)
+        self.keep_accumulating(res, v)
     }
 
     #[cold]
     #[inline(never)]
     fn cold_read_optional_signed_value(&mut self, n: u8) -> BitResult<i32> {
-        let mut res = BitResult::OK;
+        let mut res = self.start_accumulated_result();
         let flag = self.cold_read_bool(128).or_accumulate(&mut res);
         if !flag {
             // We should not read further bits if the flag is not set.
-            return self.accumulated(res, 0);
+            return self.keep_accumulating(res, 0);
         }
         let magnitude = self.cold_read_literal(n).or_accumulate(&mut res);
         let sign = self.cold_read_bool(128).or_accumulate(&mut res);
@@ -278,35 +343,14 @@ impl BoolReader {
         } else {
             i32::from(magnitude)
         };
-        self.accumulated(res, value)
-    }
-
-    // This is inlined and generic just to skip the first bounds check.
-    #[inline]
-    pub(crate) fn read_with_tree<const N: usize>(&mut self, tree: &[TreeNode; N]) -> BitResult<i8> {
-        let first_node = tree[0];
-        self.read_with_tree_with_first_node(tree, first_node)
-    }
-
-    // Do not inline this function because inlining it worsens performance.
-    #[inline(never)]
-    pub(crate) fn read_with_tree_with_first_node(
-        &mut self,
-        tree: &[TreeNode],
-        first_node: TreeNode,
-    ) -> BitResult<i8> {
-        if let Some(v) = self.fast().read_with_tree(tree, first_node) {
-            return BitResult::ok(v);
-        }
-
-        self.cold_read_with_tree(tree, usize::from(first_node.index))
+        self.keep_accumulating(res, value)
     }
 
     #[cold]
     #[inline(never)]
     fn cold_read_with_tree(&mut self, tree: &[TreeNode], start: usize) -> BitResult<i8> {
         let mut index = start;
-        let mut res = BitResult::OK;
+        let mut res = self.start_accumulated_result();
 
         loop {
             let node = tree[index];
@@ -318,14 +362,9 @@ impl BoolReader {
                 index = new_index;
             } else {
                 let value = TreeNode::value_from_branch(t);
-                return self.accumulated(res, value);
+                return self.keep_accumulating(res, value);
             }
         }
-    }
-
-    #[inline]
-    pub(crate) fn read_flag(&mut self) -> BitResult<bool> {
-        self.read_bool(128)
     }
 }
 
@@ -462,7 +501,7 @@ mod tests {
         let mut buf = vec![[0u8; 4]; 1];
         buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
         reader.init(buf, size).unwrap();
-        let mut res = BitResult::OK;
+        let mut res = reader.start_accumulated_result();
         assert_eq!(false, reader.read_bool(128).or_accumulate(&mut res));
         assert_eq!(true, reader.read_bool(10).or_accumulate(&mut res));
         assert_eq!(false, reader.read_bool(250).or_accumulate(&mut res));
@@ -481,7 +520,7 @@ mod tests {
         let mut buf = vec![[0u8; 4]; (size + 3) / 4];
         buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
         reader.init(buf, size).unwrap();
-        let mut res = BitResult::OK;
+        let mut res = reader.start_accumulated_result();
         assert_eq!(false, reader.read_bool(128).or_accumulate(&mut res));
         assert_eq!(true, reader.read_bool(10).or_accumulate(&mut res));
         assert_eq!(false, reader.read_bool(250).or_accumulate(&mut res));
@@ -496,7 +535,7 @@ mod tests {
     #[test]
     fn test_bool_reader_uninit() {
         let mut reader = BoolReader::new();
-        let mut res = BitResult::OK;
+        let mut res = reader.start_accumulated_result();
         let _ = reader.read_flag().or_accumulate(&mut res);
         let result = reader.check(res, ());
         assert!(result.is_err());

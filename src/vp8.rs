@@ -19,7 +19,6 @@ use std::io::Read;
 
 use crate::decoder::DecodingError;
 
-use super::bool_reader::BitResult;
 use super::bool_reader::BoolReader;
 use super::loop_filter;
 use super::transform;
@@ -1112,7 +1111,7 @@ impl<R: Read> Vp8Decoder<R> {
     }
 
     fn update_token_probabilities(&mut self) -> Result<(), DecodingError> {
-        let mut res = BitResult::OK;
+        let mut res = self.b.start_accumulated_result();
         for (i, is) in COEFF_UPDATE_PROBS.iter().enumerate() {
             for (j, js) in is.iter().enumerate() {
                 for (k, ks) in js.iter().enumerate() {
@@ -1165,7 +1164,7 @@ impl<R: Read> Vp8Decoder<R> {
             AC_QUANT[index.clamp(0, 127) as usize]
         }
 
-        let mut res = BitResult::OK;
+        let mut res = self.b.start_accumulated_result();
 
         let yac_abs = self.b.read_literal(7).or_accumulate(&mut res);
         let ydc_delta = self.b.read_optional_signed_value(4).or_accumulate(&mut res);
@@ -1213,7 +1212,7 @@ impl<R: Read> Vp8Decoder<R> {
     }
 
     fn read_loop_filter_adjustments(&mut self) -> Result<(), DecodingError> {
-        let mut res = BitResult::OK;
+        let mut res = self.b.start_accumulated_result();
 
         if self.b.read_flag().or_accumulate(&mut res) {
             for i in 0usize..4 {
@@ -1229,7 +1228,7 @@ impl<R: Read> Vp8Decoder<R> {
     }
 
     fn read_segment_updates(&mut self) -> Result<(), DecodingError> {
-        let mut res = BitResult::OK;
+        let mut res = self.b.start_accumulated_result();
 
         // Section 9.3
         self.segments_update_map = self.b.read_flag().or_accumulate(&mut res);
@@ -1317,7 +1316,7 @@ impl<R: Read> Vp8Decoder<R> {
         // initialise binary decoder
         self.b.init(buf, size)?;
 
-        let mut res = BitResult::OK;
+        let mut res = self.b.start_accumulated_result();
         if self.frame.keyframe {
             let color_space = self.b.read_literal(1).or_accumulate(&mut res);
             self.frame.pixel_type = self.b.read_literal(1).or_accumulate(&mut res);
@@ -1362,7 +1361,7 @@ impl<R: Read> Vp8Decoder<R> {
 
         self.update_token_probabilities()?;
 
-        let mut res = BitResult::OK;
+        let mut res = self.b.start_accumulated_result();
         let mb_no_skip_coeff = self.b.read_literal(1).or_accumulate(&mut res);
         self.prob_skip_false = if mb_no_skip_coeff == 1 {
             Some(self.b.read_literal(8).or_accumulate(&mut res))
@@ -1388,7 +1387,7 @@ impl<R: Read> Vp8Decoder<R> {
 
     fn read_macroblock_header(&mut self, mbx: usize) -> Result<MacroBlock, DecodingError> {
         let mut mb = MacroBlock::default();
-        let mut res = BitResult::OK;
+        let mut res = self.b.start_accumulated_result();
 
         if self.segments_enabled && self.segments_update_map {
             mb.segmentid =
@@ -1627,8 +1626,6 @@ impl<R: Read> Vp8Decoder<R> {
         dcq: i16,
         acq: i16,
     ) -> Result<bool, DecodingError> {
-        let mut res = BitResult::OK;
-
         // perform bounds checks once up front,
         // so that the compiler doesn't have to insert them in the hot loop below
         assert!(complexity <= 2);
@@ -1636,6 +1633,8 @@ impl<R: Read> Vp8Decoder<R> {
         let first = if plane == 0 { 1usize } else { 0usize };
         let probs = &self.token_probs[plane];
         let reader = &mut self.partitions[p];
+
+        let mut res = reader.start_accumulated_result();
 
         let mut complexity = complexity;
         let mut has_coefficients = false;
