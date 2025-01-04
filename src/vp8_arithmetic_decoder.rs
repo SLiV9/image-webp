@@ -48,8 +48,7 @@ pub(crate) struct ArithmeticDecoder {
 struct State {
     chunk_index: usize,
     value: u64,
-    range: u32,
-    bit_count: i32,
+    xrange: u64,
 }
 
 #[cfg_attr(test, derive(Debug))]
@@ -64,8 +63,7 @@ impl ArithmeticDecoder {
         let state = State {
             chunk_index: 0,
             value: 0,
-            range: 255,
-            bit_count: -8,
+            xrange: 0,
         };
         ArithmeticDecoder {
             chunks: Box::new([]),
@@ -75,11 +73,16 @@ impl ArithmeticDecoder {
         }
     }
 
-    pub(crate) fn init(&mut self, mut buf: Vec<[u8; 4]>, len: usize) -> Result<(), DecodingError> {
+    pub(crate) fn init(&mut self, buf: Vec<[u8; 4]>, len: usize) -> Result<(), DecodingError> {
+        *self = Self::initialized(buf, len)?;
+        Ok(())
+    }
+
+    pub(crate) fn initialized(mut buf: Vec<[u8; 4]>, len: usize) -> Result<Self, DecodingError> {
         let mut final_bytes = [0; 3];
-        let final_bytes_remaining = if len == 4 * buf.len() {
-            0
-        } else {
+        let mut final_bytes_remaining = 0;
+
+        if len != 4 * buf.len() {
             // Pop the last chunk (which is partial), then get length.
             let Some(last_chunk) = buf.pop() else {
                 return Err(DecodingError::NotEnoughInitData);
@@ -91,23 +94,38 @@ impl ArithmeticDecoder {
             for i in num_bytes_popped..4 {
                 debug_assert_eq!(last_chunk[i], 0, "unexpected {last_chunk:?}");
             }
-            num_bytes_popped as i8
-        };
+            final_bytes_remaining = num_bytes_popped as i8;
+        }
 
         let chunks = buf.into_boxed_slice();
-        let state = State {
-            chunk_index: 0,
-            value: 0,
-            range: 255,
-            bit_count: -8,
+        let state = if let Some(chunk) = chunks.first().copied() {
+            let v = u32::from_be_bytes(chunk);
+            State {
+                chunk_index: 1,
+                value: u64::from(v),
+                xrange: 0xFF000000,
+            }
+        } else {
+            let value = if final_bytes_remaining > 0 {
+                let byte = final_bytes[0];
+                final_bytes.rotate_left(1);
+                u64::from(byte)
+            } else {
+                0
+            };
+            final_bytes_remaining -= 1;
+            State {
+                chunk_index: 1,
+                value,
+                xrange: 0xFF,
+            }
         };
-        *self = Self {
+        Ok(Self {
             chunks,
             state,
             final_bytes,
             final_bytes_remaining,
-        };
-        Ok(())
+        })
     }
 
     /// Start a span of reading operations from the buffer, without stopping
@@ -244,16 +262,16 @@ impl ArithmeticDecoder {
                 self.final_bytes_remaining -= 1;
                 let byte = self.final_bytes[0];
                 self.final_bytes.rotate_left(1);
+                self.state.xrange <<= 8;
                 self.state.value <<= 8;
                 self.state.value |= u64::from(byte);
-                self.state.bit_count += 8;
             }
             0 => {
                 // libwebp seems to (sometimes?) allow bitstreams that read one byte past the end.
                 // This replicates that logic.
                 self.final_bytes_remaining -= 1;
+                self.state.xrange <<= 8;
                 self.state.value <<= 8;
-                self.state.bit_count += 8;
             }
             _ => {
                 self.final_bytes_remaining = Self::FINAL_BYTES_REMAINING_EOF;
@@ -266,13 +284,13 @@ impl ArithmeticDecoder {
     }
 
     fn cold_read_bit(&mut self, probability: u8) -> BitResult<bool> {
-        if self.state.bit_count < 0 {
+        if self.state.xrange.leading_zeros() > 56 {
             if let Some(chunk) = self.chunks.get(self.state.chunk_index).copied() {
                 let v = u32::from_be_bytes(chunk);
                 self.state.chunk_index += 1;
+                self.state.xrange <<= 32;
                 self.state.value <<= 32;
                 self.state.value |= u64::from(v);
-                self.state.bit_count += 32;
             } else {
                 self.load_from_final_bytes();
                 if self.is_past_eof() {
@@ -280,31 +298,26 @@ impl ArithmeticDecoder {
                 }
             }
         }
-        debug_assert!(self.state.bit_count >= 0);
+        debug_assert!(self.state.xrange.leading_zeros() <= 56);
+        debug_assert!(self.state.xrange.leading_zeros() >= 24);
 
-        let probability = u32::from(probability);
-        let split = 1 + (((self.state.range - 1) * probability) >> 8);
-        let bigsplit = u64::from(split) << self.state.bit_count;
+        let xrange = self.state.xrange;
+        let bsr = xrange.leading_zeros();
+        let bit_count = 56 - bsr;
+        let range = xrange >> bit_count;
+        debug_assert!(range <= 0xFF);
+        let probability = u64::from(probability);
+        let split = 1 + (((range - 1) * probability) >> 8);
+        let bigsplit = split << bit_count;
 
         let retval = if let Some(new_value) = self.state.value.checked_sub(bigsplit) {
-            self.state.range -= split;
+            self.state.xrange -= bigsplit;
             self.state.value = new_value;
             true
         } else {
-            self.state.range = split;
+            self.state.xrange = bigsplit;
             false
         };
-        debug_assert!(self.state.range > 0);
-
-        // Compute shift required to satisfy `self.state.range >= 128`.
-        // Apply that shift to `self.state.range` and `self.state.bitcount`.
-        //
-        // Subtract 24 because we only care about leading zeros in the
-        // lowest byte of `self.state.range` which is a `u32`.
-        let shift = self.state.range.leading_zeros().saturating_sub(24);
-        self.state.range <<= shift;
-        self.state.bit_count -= shift as i32;
-        debug_assert!(self.state.range >= 128);
 
         BitResult::ok(retval)
     }
@@ -429,11 +442,10 @@ impl FastDecoder<'_> {
         let State {
             mut chunk_index,
             mut value,
-            mut range,
-            mut bit_count,
+            mut xrange,
         } = self.uncommitted_state;
 
-        if bit_count < 0 {
+        if xrange.leading_zeros() > 56 {
             let chunk = self.chunks.get(chunk_index).copied();
             // We ignore invalid data inside the `fast_` functions,
             // but we increase `chunk_index` below, so we can check
@@ -442,41 +454,34 @@ impl FastDecoder<'_> {
 
             let v = u32::from_be_bytes(chunk);
             chunk_index += 1;
+            xrange <<= 32;
             value <<= 32;
             value |= u64::from(v);
-            bit_count += 32;
         }
-        debug_assert!(bit_count >= 0);
+        debug_assert!(xrange.leading_zeros() <= 56);
+        debug_assert!(xrange.leading_zeros() >= 24);
 
-        let probability = u32::from(probability);
+        let bsr = xrange.leading_zeros();
+        let bit_count = 56 - bsr;
+        let range = xrange >> bit_count;
+        debug_assert!(range <= 0xFF);
+        let probability = u64::from(probability);
         let split = 1 + (((range - 1) * probability) >> 8);
-        let bigsplit = u64::from(split) << bit_count;
+        let bigsplit = split << bit_count;
 
         let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
-            range -= split;
+            xrange -= bigsplit;
             value = new_value;
             true
         } else {
-            range = split;
+            xrange = bigsplit;
             false
         };
-        debug_assert!(range > 0);
-
-        // Compute shift required to satisfy `range >= 128`.
-        // Apply that shift to `range` and `self.bitcount`.
-        //
-        // Subtract 24 because we only care about leading zeros in the
-        // lowest byte of `range` which is a `u32`.
-        let shift = range.leading_zeros().saturating_sub(24);
-        range <<= shift;
-        bit_count -= shift as i32;
-        debug_assert!(range >= 128);
 
         self.uncommitted_state = State {
             chunk_index,
             value,
-            range,
-            bit_count,
+            xrange,
         };
         retval
     }
@@ -485,11 +490,10 @@ impl FastDecoder<'_> {
         let State {
             mut chunk_index,
             mut value,
-            mut range,
-            mut bit_count,
+            mut xrange,
         } = self.uncommitted_state;
 
-        if bit_count < 0 {
+        if xrange.leading_zeros() > 56 {
             let chunk = self.chunks.get(chunk_index).copied();
             // We ignore invalid data inside the `fast_` functions,
             // but we increase `chunk_index` below, so we can check
@@ -498,41 +502,32 @@ impl FastDecoder<'_> {
 
             let v = u32::from_be_bytes(chunk);
             chunk_index += 1;
+            xrange <<= 32;
             value <<= 32;
             value |= u64::from(v);
-            bit_count += 32;
         }
-        debug_assert!(bit_count >= 0);
+        debug_assert!(xrange.leading_zeros() <= 56);
+        debug_assert!(xrange.leading_zeros() >= 24);
 
-        let half_range = range / 2;
-        let split = range - half_range;
-        let bigsplit = u64::from(split) << bit_count;
+        let bsr = xrange.leading_zeros();
+        let bit_count = 56 - bsr;
+        let half_range = xrange >> (bit_count + 1);
+        let half_xrange = half_range << bit_count;
+        let bigsplit = xrange - half_xrange;
 
         let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
-            range = half_range;
+            xrange = half_xrange;
             value = new_value;
             true
         } else {
-            range = split;
+            xrange = bigsplit;
             false
         };
-        debug_assert!(range > 0);
-
-        // Compute shift required to satisfy `range >= 128`.
-        // Apply that shift to `range` and `self.bitcount`.
-        //
-        // Subtract 24 because we only care about leading zeros in the
-        // lowest byte of `range` which is a `u32`.
-        let shift = range.leading_zeros().saturating_sub(24);
-        range <<= shift;
-        bit_count -= shift as i32;
-        debug_assert!(range >= 128);
 
         self.uncommitted_state = State {
             chunk_index,
             value,
-            range,
-            bit_count,
+            xrange,
         };
         retval
     }
@@ -608,7 +603,26 @@ mod tests {
     }
 
     #[test]
-    fn test_arithmetic_decoder_hello_cold() {
+    fn test_arithmetic_decoder_hello_cold_short() {
+        let mut decoder = ArithmeticDecoder::new();
+        let data = b"hel";
+        let size = data.len();
+        let mut buf = vec![[0u8; 4]; 1];
+        buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
+        decoder.init(buf, size).unwrap();
+        let mut res = decoder.start_accumulated_result();
+        assert_eq!(false, decoder.cold_read_flag().or_accumulate(&mut res));
+        assert_eq!(true, decoder.cold_read_bool(10).or_accumulate(&mut res));
+        assert_eq!(false, decoder.cold_read_bool(250).or_accumulate(&mut res));
+        assert_eq!(1, decoder.cold_read_literal(1).or_accumulate(&mut res));
+        assert_eq!(5, decoder.cold_read_literal(3).or_accumulate(&mut res));
+        assert_eq!(64, decoder.cold_read_literal(8).or_accumulate(&mut res));
+        assert_eq!(185, decoder.cold_read_literal(8).or_accumulate(&mut res));
+        decoder.check(res, ()).unwrap();
+    }
+
+    #[test]
+    fn test_arithmetic_decoder_hello_cold_long() {
         let mut decoder = ArithmeticDecoder::new();
         let data = b"hello world";
         let size = data.len();
@@ -634,11 +648,11 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn test_arithmetic_decoder_uninit() {
         let mut decoder = ArithmeticDecoder::new();
         let mut res = decoder.start_accumulated_result();
         let _ = decoder.read_flag().or_accumulate(&mut res);
-        let result = decoder.check(res, ());
-        assert!(result.is_err());
+        decoder.check(res, ()).unwrap()
     }
 }
