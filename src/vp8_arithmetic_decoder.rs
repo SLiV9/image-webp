@@ -41,8 +41,6 @@ pub(crate) struct ArithmeticDecoder {
     state: State,
     final_bytes: [u8; 3],
     final_bytes_remaining: i8,
-    xvalue: u64,
-    xrange: u64,
 }
 
 #[cfg_attr(test, derive(Debug))]
@@ -74,8 +72,6 @@ impl ArithmeticDecoder {
             state,
             final_bytes: [0; 3],
             final_bytes_remaining: Self::FINAL_BYTES_REMAINING_EOF,
-            xvalue: 0,
-            xrange: (255u64 << 32) | u64::from(u32::MAX),
         }
     }
 
@@ -110,8 +106,6 @@ impl ArithmeticDecoder {
             state,
             final_bytes,
             final_bytes_remaining,
-            xvalue: 0,
-            xrange: (255u64 << 32) | u64::from(u32::MAX),
         };
         Ok(())
     }
@@ -277,15 +271,9 @@ impl ArithmeticDecoder {
             let value = self.state.value;
             let range = self.state.range;
             let bit_count = self.state.bit_count;
-            let xvalue = self.xvalue;
-            let xrange = self.xrange;
-            dbg!(value, xvalue, xrange, range, bit_count, probability);
-            println!(
-                "value={value:#012x} xvalue={xvalue:#012x} xrange={xrange:#012x} range={range:#04x}"
-            );
-            println!(
-                "value={value:#042b} xvalue={xvalue:#042b} xrange={xrange:#042b} range={range:#010b}"
-            );
+            dbg!(value, range, bit_count, bit_count, probability);
+            println!("value={value:#012x} range={range:#04x}");
+            println!("value={value:#042b} range={range:#010b}");
         }
 
         if self.state.bit_count < 0 {
@@ -295,8 +283,6 @@ impl ArithmeticDecoder {
                 self.state.value <<= 32;
                 self.state.value |= u64::from(v);
                 self.state.bit_count += 32;
-                self.xvalue <<= 32;
-                self.xvalue |= u64::from(v);
             } else {
                 self.load_from_final_bytes();
                 if self.is_past_eof() {
@@ -309,45 +295,32 @@ impl ArithmeticDecoder {
                 let value = self.state.value;
                 let range = self.state.range;
                 let bit_count = self.state.bit_count;
-                let xvalue = self.xvalue;
-                let xrange = self.xrange;
-                dbg!(value, xvalue, xrange, range, bit_count, probability);
-                println!(
-                    "value={value:#012x} xvalue={xvalue:#012x} xrange={xrange:#012x} range={range:#04x}"
-                );
-                println!(
-                    "value={value:#042b} xvalue={xvalue:#042b} xrange={xrange:#042b} range={range:#010b}"
-                );
+                dbg!(value, range, bit_count, bit_count);
+                println!("value={value:#012x} range={range:#04x}");
+                println!("value={value:#042b} range={range:#010b}");
             }
         }
         debug_assert!(self.state.bit_count >= 0);
         debug_assert!(self.state.bit_count < 32);
         debug_assert!(self.state.value < (1u64 << 40));
         debug_assert!(self.state.range <= u32::from(u8::MAX));
-        debug_assert!(self.xvalue < (1u64 << 40));
-        debug_assert!(self.xrange < (1u64 << 40));
 
         let probability = u32::from(probability);
         let split = 1 + (((self.state.range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << self.state.bit_count;
         debug_assert!(split <= u32::from(u8::MAX));
 
-        let probability = u64::from(probability);
-        let xsplit = 1 + ((self.xrange - 1) * probability) >> 8;
-
         // TODO remove
         {
             let value = self.state.value;
             let range = self.state.range;
             let bit_count = self.state.bit_count;
-            let xvalue = self.xvalue;
-            let xrange = self.xrange;
-            dbg!(value, xvalue, xrange, range, bit_count, split, bigsplit, xsplit);
+            dbg!(value, range, bit_count, split, bigsplit);
             println!(
-                "value={value:#012x} xvalue={xvalue:#012x} xrange={xrange:#012x} range={range:#04x} split={split:#04x} bigsplit={bigsplit:#012x} xsplit={xsplit:#012x}"
+                "value={value:#012x} range={range:#04x} split={split:#04x} bigsplit={bigsplit:#012x}"
             );
             println!(
-                "value={value:#042b} xvalue={xvalue:#042b} xrange={xrange:#042b} range={range:#010b} split={split:#010b} bigsplit={bigsplit:#042b} xsplit={xsplit:#042b}"
+                "value={value:#042b} range={range:#010b} split={split:#010b} bigsplit={bigsplit:#042b}"
             );
         }
 
@@ -359,19 +332,8 @@ impl ArithmeticDecoder {
             self.state.range = split;
             false
         };
-        let xretval = if let Some(new_value) = self.xvalue.checked_sub(xsplit) {
-            self.xvalue = new_value;
-            self.xrange -= xsplit;
-            true
-        } else {
-            self.xrange = xsplit;
-            false
-        };
         debug_assert!(self.state.range > 0);
         debug_assert!(self.state.range <= u32::from(u8::MAX));
-
-        // TODO remove
-        dbg!(retval, xretval);
 
         // Compute shift required to satisfy `self.state.range >= 128`.
         // Apply that shift to `self.state.range` and `self.state.bitcount`.
