@@ -563,6 +563,10 @@ impl FastDecoder<'_> {
 mod tests {
     use super::*;
 
+    use crate::vp8::tree_nodes_from;
+
+    const TREE: [TreeNode; 3] = tree_nodes_from([2, 4, -0, -1, -2, -3], [100, 120, 140]);
+
     #[test]
     fn test_arithmetic_decoder_hello_short() {
         let mut decoder = ArithmeticDecoder::new();
@@ -599,6 +603,33 @@ mod tests {
         assert_eq!(64, decoder.read_literal(8).or_accumulate(&mut res));
         assert_eq!(185, decoder.read_literal(8).or_accumulate(&mut res));
         assert_eq!(31, decoder.read_literal(8).or_accumulate(&mut res));
+        assert_eq!(2, decoder.read_with_tree(&TREE).or_accumulate(&mut res));
+        decoder.check(res, ()).unwrap();
+    }
+
+    #[test]
+    fn test_arithmetic_decoder_hello_cold() {
+        let mut decoder = ArithmeticDecoder::new();
+        let data = b"hello world";
+        let size = data.len();
+        let mut buf = vec![[0u8; 4]; (size + 3) / 4];
+        buf.as_mut_slice().as_flattened_mut()[..size].copy_from_slice(&data[..]);
+        decoder.init(buf, size).unwrap();
+        let mut res = decoder.start_accumulated_result();
+        assert_eq!(false, decoder.cold_read_flag().or_accumulate(&mut res));
+        assert_eq!(true, decoder.cold_read_bool(10).or_accumulate(&mut res));
+        assert_eq!(false, decoder.cold_read_bool(250).or_accumulate(&mut res));
+        assert_eq!(1, decoder.cold_read_literal(1).or_accumulate(&mut res));
+        assert_eq!(5, decoder.cold_read_literal(3).or_accumulate(&mut res));
+        assert_eq!(64, decoder.cold_read_literal(8).or_accumulate(&mut res));
+        assert_eq!(185, decoder.cold_read_literal(8).or_accumulate(&mut res));
+        assert_eq!(31, decoder.cold_read_literal(8).or_accumulate(&mut res));
+        assert_eq!(
+            2,
+            decoder
+                .cold_read_with_tree(&TREE, 0)
+                .or_accumulate(&mut res)
+        );
         decoder.check(res, ()).unwrap();
     }
 

@@ -130,7 +130,7 @@ impl TreeNode {
     }
 }
 
-const fn tree_nodes_from<const N: usize, const M: usize>(
+pub(crate) const fn tree_nodes_from<const N: usize, const M: usize>(
     tree: [i8; N],
     probs: [Prob; M],
 ) -> [TreeNode; M] {
