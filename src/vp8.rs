@@ -125,8 +125,11 @@ impl TreeNode {
         }
     }
 
-    pub(crate) const fn value_from_branch(t: u8) -> i8 {
-        (t & !0x80) as i8
+    pub(crate) const fn value_from_branch(t: u8) -> Option<i8> {
+        match t.checked_sub(0x80) {
+            Some(v) => Some(v as i8),
+            None => None,
+        }
     }
 }
 

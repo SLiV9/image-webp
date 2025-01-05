@@ -380,12 +380,10 @@ impl ArithmeticDecoder {
             let b = self.cold_read_bit(prob).or_accumulate(&mut res);
             let t = if b { node.right } else { node.left };
             let new_index = usize::from(t);
-            if new_index < tree.len() {
-                index = new_index;
-            } else {
-                let value = TreeNode::value_from_branch(t);
+            if let Some(value) = TreeNode::value_from_branch(t) {
                 return self.keep_accumulating(res, value);
             }
+            index = new_index;
         }
     }
 }
@@ -542,14 +540,27 @@ impl FastDecoder<'_> {
     }
 
     fn fast_read_with_tree(&mut self, tree: &[TreeNode], mut node: TreeNode) -> i8 {
+        let zeroes: TreeNode = TreeNode {
+            left: 0,
+            right: 0,
+            prob: 0,
+            index: 0,
+        };
+        let prefetch = |i: u8| -> &TreeNode { tree.get(usize::from(i)).unwrap_or(&zeroes) };
+
         loop {
             let prob = node.prob;
+            let left = prefetch(node.left);
+            let right = prefetch(node.right);
+            let (left, right) = std::hint::black_box((left, right));
+            let left = *left;
+            let right = *right;
             let b = self.fast_read_bit(prob);
             let i = if b { node.right } else { node.left };
-            let Some(next_node) = tree.get(usize::from(i)) else {
-                return TreeNode::value_from_branch(i);
-            };
-            node = *next_node;
+            if let Some(v) = TreeNode::value_from_branch(i) {
+                return v;
+            }
+            node = if b { right } else { left };
         }
     }
 }
