@@ -54,8 +54,7 @@ struct State {
 #[cfg_attr(test, derive(Debug))]
 struct FastDecoder<'a> {
     chunks: &'a [[u8; 4]],
-    uncommitted_state: State,
-    save_state: &'a mut State,
+    state: &'a mut State,
 }
 
 impl ArithmeticDecoder {
@@ -176,40 +175,48 @@ impl ArithmeticDecoder {
     // Do not inline this because inlining seems to worsen performance.
     #[inline(never)]
     pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
+        let backup_state = self.state;
         if let Some(b) = self.fast().read_bool(probability) {
             return BitResult::ok(b);
         }
 
+        self.state = backup_state;
         self.cold_read_bool(probability)
     }
 
     // Do not inline this because inlining seems to worsen performance.
     #[inline(never)]
     pub(crate) fn read_flag(&mut self) -> BitResult<bool> {
+        let backup_state = self.state;
         if let Some(b) = self.fast().read_flag() {
             return BitResult::ok(b);
         }
 
+        self.state = backup_state;
         self.cold_read_flag()
     }
 
     // Do not inline this because inlining seems to worsen performance.
     #[inline(never)]
     pub(crate) fn read_literal(&mut self, n: u8) -> BitResult<u8> {
+        let backup_state = self.state;
         if let Some(v) = self.fast().read_literal(n) {
             return BitResult::ok(v);
         }
 
+        self.state = backup_state;
         self.cold_read_literal(n)
     }
 
     // Do not inline this because inlining seems to worsen performance.
     #[inline(never)]
     pub(crate) fn read_optional_signed_value(&mut self, n: u8) -> BitResult<i32> {
+        let backup_state = self.state;
         if let Some(v) = self.fast().read_optional_signed_value(n) {
             return BitResult::ok(v);
         }
 
+        self.state = backup_state;
         self.cold_read_optional_signed_value(n)
     }
 
@@ -227,15 +234,19 @@ impl ArithmeticDecoder {
         tree: &[TreeNode],
         first_node: TreeNode,
     ) -> BitResult<i8> {
+        let backup_state = self.state;
         if let Some(v) = self.fast().read_with_tree(tree, first_node) {
             return BitResult::ok(v);
         }
 
+        self.state = backup_state;
         self.cold_read_with_tree(tree, usize::from(first_node.index))
     }
 
     // As a similar (but different) speedup to BitResult, the FastDecoder reads
     // bits under an assumption and validates it at the end.
+    //
+    // TODO UPDATE THIS DESCRIPTION
     //
     // The idea here is that for normal-sized webp images, the vast majority
     // of bits are somewhere other than in the last four bytes. Therefore we
@@ -249,8 +260,7 @@ impl ArithmeticDecoder {
     fn fast(&mut self) -> FastDecoder<'_> {
         FastDecoder {
             chunks: &self.chunks,
-            uncommitted_state: self.state,
-            save_state: &mut self.state,
+            state: &mut self.state,
         }
     }
 
@@ -391,11 +401,10 @@ impl ArithmeticDecoder {
 }
 
 impl FastDecoder<'_> {
-    fn commit_if_valid<T>(self, value_if_not_past_eof: T) -> Option<T> {
+    fn return_if_valid<T>(self, value_if_not_past_eof: T) -> Option<T> {
         // If `chunk_index > self.chunks.len()`, it means we used zeroes
         // instead of an actual chunk and `value_if_not_past_eof` is nonsense.
-        if self.uncommitted_state.chunk_index <= self.chunks.len() {
-            *self.save_state = self.uncommitted_state;
+        if self.state.chunk_index <= self.chunks.len() {
             Some(value_if_not_past_eof)
         } else {
             None
@@ -404,24 +413,24 @@ impl FastDecoder<'_> {
 
     fn read_bool(mut self, probability: u8) -> Option<bool> {
         let bit = self.fast_read_bit(probability);
-        self.commit_if_valid(bit)
+        self.return_if_valid(bit)
     }
 
     fn read_flag(mut self) -> Option<bool> {
         let value = self.fast_read_flag();
-        self.commit_if_valid(value)
+        self.return_if_valid(value)
     }
 
     fn read_literal(mut self, n: u8) -> Option<u8> {
         let value = self.fast_read_literal(n);
-        self.commit_if_valid(value)
+        self.return_if_valid(value)
     }
 
     fn read_optional_signed_value(mut self, n: u8) -> Option<i32> {
         let flag = self.fast_read_flag();
         if !flag {
             // We should not read further bits if the flag is not set.
-            return self.commit_if_valid(0);
+            return self.return_if_valid(0);
         }
         let magnitude = self.fast_read_literal(n);
         let sign = self.fast_read_flag();
@@ -430,12 +439,12 @@ impl FastDecoder<'_> {
         } else {
             i32::from(magnitude)
         };
-        self.commit_if_valid(value)
+        self.return_if_valid(value)
     }
 
     fn read_with_tree(mut self, tree: &[TreeNode], first_node: TreeNode) -> Option<i8> {
         let value = self.fast_read_with_tree(tree, first_node);
-        self.commit_if_valid(value)
+        self.return_if_valid(value)
     }
 
     fn fast_read_bit(&mut self, probability: u8) -> bool {
@@ -443,13 +452,13 @@ impl FastDecoder<'_> {
             mut chunk_index,
             mut value,
             mut xrange,
-        } = self.uncommitted_state;
+        } = *self.state;
 
         if xrange.leading_zeros() > 56 {
             let chunk = self.chunks.get(chunk_index).copied();
             // We ignore invalid data inside the `fast_` functions,
             // but we increase `chunk_index` below, so we can check
-            // whether we read invalid data in `commit_if_valid`.
+            // whether we read invalid data in `return_if_valid`.
             let chunk = chunk.unwrap_or_default();
 
             let v = u32::from_be_bytes(chunk);
@@ -478,7 +487,7 @@ impl FastDecoder<'_> {
             false
         };
 
-        self.uncommitted_state = State {
+        *self.state = State {
             chunk_index,
             value,
             xrange,
@@ -491,13 +500,13 @@ impl FastDecoder<'_> {
             mut chunk_index,
             mut value,
             mut xrange,
-        } = self.uncommitted_state;
+        } = *self.state;
 
         if xrange.leading_zeros() > 56 {
             let chunk = self.chunks.get(chunk_index).copied();
             // We ignore invalid data inside the `fast_` functions,
             // but we increase `chunk_index` below, so we can check
-            // whether we read invalid data in `commit_if_valid`.
+            // whether we read invalid data in `return_if_valid`.
             let chunk = chunk.unwrap_or_default();
 
             let v = u32::from_be_bytes(chunk);
@@ -524,7 +533,7 @@ impl FastDecoder<'_> {
             false
         };
 
-        self.uncommitted_state = State {
+        *self.state = State {
             chunk_index,
             value,
             xrange,
