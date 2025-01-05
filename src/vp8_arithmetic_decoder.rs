@@ -460,12 +460,13 @@ impl FastDecoder<'_> {
         debug_assert!(xrange.leading_zeros() <= 56);
         debug_assert!(xrange.leading_zeros() >= 24);
 
-        let probability = u64::from(probability);
-        let bsr = xrange.leading_zeros() as i32 - 32;
-        let bit_count = 24 - bsr;
-        let range = xrange >> bit_count;
+        let bsr = xrange.leading_zeros();
+        let bit_count = 56 - bsr;
+        let range = (xrange >> bit_count) as u16;
         debug_assert!(range <= 0xFF);
-        let split = 1 + (((range - 1) * probability) >> 8);
+        let probability = u16::from(probability);
+        let x = 0x0100 + ((range - 1) * probability);
+        let [_, split] = x.to_le_bytes();
         let bigsplit = u64::from(split) << bit_count;
 
         let retval = if let Some(new_value) = value.checked_sub(bigsplit) {

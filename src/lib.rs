@@ -44,18 +44,16 @@ pub fn foo(xrange: u64, probability: u8) -> u64 {
 pub fn bar(xrange: u64, probability: u8) -> u64 {
     debug_assert!(xrange.leading_zeros() <= 56);
     debug_assert!(xrange.leading_zeros() >= 24);
-    let probability = u64::from(probability);
-    let s = xrange.leading_zeros() - 24;
-    let mut r = xrange << s;
-    debug_assert_eq!(r.leading_zeros(), 24);
-    r &= 0x000000FF00000000;
-    r -= 0x0000000100000000;
-    r *= probability;
-    r &= 0x0000FF0000000000;
-    r += 0x0000010000000000;
-    r >>= s + 8;
+    let bsr = xrange.leading_zeros();
+    let bit_count = 56 - bsr;
+    let range = (xrange >> bit_count) as u16;
+    debug_assert!(range <= 0xFF);
+    let probability = u16::from(probability);
+    let x = 0x0100 + ((range - 1) * probability);
+    let [_, split] = x.to_le_bytes();
+    let bigsplit = u64::from(split) << bit_count;
 
-    r
+    bigsplit
 }
 
 #[cfg(test)]
@@ -64,21 +62,17 @@ mod tests {
 
     #[test]
     fn test_foo_bar() {
-        let mut xrange = 0x000000017b;
-        for i in 0..20 {
-            for prob in 0..256 {
-                let a = foo(xrange, prob as u8);
-                let b = bar(xrange, prob as u8);
-                let bsr = xrange.leading_zeros() as i32 - 32;
-                let bit_count = 24 - bsr;
-                let range = (xrange >> bit_count) & 0xFF;
-                if a != b {
-                    eprintln!("xrange={xrange:#042b} bsr={bsr} bit_count={bit_count} range={range} prob={prob} a={a} b={b}");
-                }
-                assert_eq!(a, b);
+        let xrange = 0x000000017b;
+        for prob in 0..=255 {
+            let a = foo(xrange, prob as u8);
+            let b = bar(xrange, prob as u8);
+            let bsr = xrange.leading_zeros() as i32 - 32;
+            let bit_count = 24 - bsr;
+            let range = (xrange >> bit_count) & 0xFF;
+            if a != b {
+                eprintln!("xrange={xrange:#042b} bsr={bsr} bit_count={bit_count} range={range} prob={prob} a={a} b={b}");
             }
-            xrange <<= 1;
-            xrange |= ((i * 13) % 17) & 0b1;
+            assert_eq!(a, b);
         }
     }
 }
