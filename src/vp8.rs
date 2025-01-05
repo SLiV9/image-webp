@@ -98,14 +98,14 @@ enum IntraMode {
     HU = B_HU_PRED,
 }
 
-type Prob = u64;
+type Prob = u8;
 
 #[derive(Clone, Copy)]
 pub(crate) struct TreeNode {
-    pub left: usize,
-    pub right: usize,
+    pub left: u8,
+    pub right: u8,
     pub prob: Prob,
-    pub index: usize,
+    pub index: u8,
 }
 
 impl TreeNode {
@@ -116,17 +116,17 @@ impl TreeNode {
         index: 0,
     };
 
-    const fn prepare_branch(t: i8) -> usize {
+    const fn prepare_branch(t: i8) -> u8 {
         if t > 0 {
-            ((t as u8) / 2) as usize
+            (t as u8) / 2
         } else {
             let value = -t;
-            (0x80 | (value as u8)) as usize
+            0x80 | (value as u8)
         }
     }
 
-    pub(crate) const fn value_from_branch(t: usize) -> i8 {
-        ((t as u8) & !0x80) as i8
+    pub(crate) const fn value_from_branch(t: u8) -> i8 {
+        (t & !0x80) as i8
     }
 }
 
@@ -143,7 +143,7 @@ pub(crate) const fn tree_nodes_from<const N: usize, const M: usize>(
         nodes[i].left = TreeNode::prepare_branch(tree[2 * i]);
         nodes[i].right = TreeNode::prepare_branch(tree[2 * i + 1]);
         nodes[i].prob = probs[i];
-        nodes[i].index = i;
+        nodes[i].index = i as u8;
         i += 1;
     }
     nodes
@@ -1097,7 +1097,7 @@ impl<R: Read> Vp8Decoder<R> {
             token_probs: Box::new(COEFF_PROB_NODES),
 
             // Section 9.10
-            prob_intra: 0,
+            prob_intra: 0u8,
 
             // Section 9.11
             prob_skip_false: None,
@@ -1118,7 +1118,7 @@ impl<R: Read> Vp8Decoder<R> {
                     for (t, prob) in ks.iter().enumerate().take(NUM_DCT_TOKENS - 1) {
                         if self.b.read_bool(*prob).or_accumulate(&mut res) {
                             let v = self.b.read_literal(8).or_accumulate(&mut res);
-                            self.token_probs[i][j][k][t].prob = u64::from(v);
+                            self.token_probs[i][j][k][t].prob = v;
                         }
                     }
                 }
@@ -1261,7 +1261,7 @@ impl<R: Read> Vp8Decoder<R> {
                 } else {
                     255
                 };
-                self.segment_tree_nodes[i].prob = u64::from(prob);
+                self.segment_tree_nodes[i].prob = prob;
             }
         }
 
@@ -1364,7 +1364,7 @@ impl<R: Read> Vp8Decoder<R> {
         let mut res = self.b.start_accumulated_result();
         let mb_no_skip_coeff = self.b.read_literal(1).or_accumulate(&mut res);
         self.prob_skip_false = if mb_no_skip_coeff == 1 {
-            Some(u64::from(self.b.read_literal(8).or_accumulate(&mut res)))
+            Some(self.b.read_literal(8).or_accumulate(&mut res))
         } else {
             None
         };

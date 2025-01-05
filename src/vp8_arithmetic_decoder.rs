@@ -175,7 +175,7 @@ impl ArithmeticDecoder {
 
     // Do not inline this because inlining seems to worsen performance.
     #[inline(never)]
-    pub(crate) fn read_bool(&mut self, probability: u64) -> BitResult<bool> {
+    pub(crate) fn read_bool(&mut self, probability: u8) -> BitResult<bool> {
         if let Some(b) = self.fast().read_bool(probability) {
             return BitResult::ok(b);
         }
@@ -283,7 +283,7 @@ impl ArithmeticDecoder {
         self.final_bytes_remaining == Self::FINAL_BYTES_REMAINING_EOF
     }
 
-    fn cold_read_bit(&mut self, probability: u64) -> BitResult<bool> {
+    fn cold_read_bit(&mut self, probability: u8) -> BitResult<bool> {
         if self.state.xrange.leading_zeros() > 56 {
             if let Some(chunk) = self.chunks.get(self.state.chunk_index).copied() {
                 let v = u32::from_be_bytes(chunk);
@@ -304,10 +304,11 @@ impl ArithmeticDecoder {
         let xrange = self.state.xrange;
         let bsr = xrange.leading_zeros();
         let bit_count = 56 - bsr;
-        let range = xrange >> bit_count;
+        let range = (xrange >> bit_count) as u32;
         debug_assert!(range <= 0xFF);
+        let probability = u32::from(probability);
         let split = 1 + (((range - 1) * probability) >> 8);
-        let bigsplit = split << bit_count;
+        let bigsplit = u64::from(split) << bit_count;
 
         let retval = if let Some(new_value) = self.state.value.checked_sub(bigsplit) {
             self.state.xrange -= bigsplit;
@@ -323,7 +324,7 @@ impl ArithmeticDecoder {
 
     #[cold]
     #[inline(never)]
-    fn cold_read_bool(&mut self, probability: u64) -> BitResult<bool> {
+    fn cold_read_bool(&mut self, probability: u8) -> BitResult<bool> {
         self.cold_read_bit(probability)
     }
 
@@ -401,7 +402,7 @@ impl FastDecoder<'_> {
         }
     }
 
-    fn read_bool(mut self, probability: u64) -> Option<bool> {
+    fn read_bool(mut self, probability: u8) -> Option<bool> {
         let bit = self.fast_read_bit(probability);
         self.commit_if_valid(bit)
     }
@@ -437,7 +438,7 @@ impl FastDecoder<'_> {
         self.commit_if_valid(value)
     }
 
-    fn fast_read_bit(&mut self, probability: u64) -> bool {
+    fn fast_read_bit(&mut self, probability: u8) -> bool {
         let State {
             mut chunk_index,
             mut value,
@@ -462,10 +463,11 @@ impl FastDecoder<'_> {
 
         let bsr = xrange.leading_zeros();
         let bit_count = 56 - bsr;
-        let range = xrange >> bit_count;
+        let range = (xrange >> bit_count) as u32;
         debug_assert!(range <= 0xFF);
+        let probability = u32::from(probability);
         let split = 1 + (((range - 1) * probability) >> 8);
-        let bigsplit = split << bit_count;
+        let bigsplit = u64::from(split) << bit_count;
 
         let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
             xrange -= bigsplit;
