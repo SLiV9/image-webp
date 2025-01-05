@@ -98,7 +98,7 @@ impl ArithmeticDecoder {
         }
 
         let chunks = buf.into_boxed_slice();
-        let state = if let Some(chunk) = chunks.get(0).copied() {
+        let state = if let Some(chunk) = chunks.first().copied() {
             let v = u32::from_be_bytes(chunk);
             State {
                 chunk_index: 1,
@@ -304,11 +304,11 @@ impl ArithmeticDecoder {
         let xrange = self.state.xrange;
         let bsr = xrange.leading_zeros();
         let bit_count = 56 - bsr;
-        let range = (xrange >> bit_count) as u32;
+        let range = xrange >> bit_count;
         debug_assert!(range <= 0xFF);
-        let probability = u32::from(probability);
+        let probability = u64::from(probability);
         let split = 1 + (((range - 1) * probability) >> 8);
-        let bigsplit = u64::from(split) << bit_count;
+        let bigsplit = split << bit_count;
 
         let retval = if let Some(new_value) = self.state.value.checked_sub(bigsplit) {
             self.state.xrange -= bigsplit;
@@ -463,11 +463,11 @@ impl FastDecoder<'_> {
 
         let bsr = xrange.leading_zeros();
         let bit_count = 56 - bsr;
-        let range = (xrange >> bit_count) as u32;
+        let range = xrange >> bit_count;
         debug_assert!(range <= 0xFF);
-        let probability = u32::from(probability);
+        let probability = u64::from(probability);
         let split = 1 + (((range - 1) * probability) >> 8);
-        let bigsplit = u64::from(split) << bit_count;
+        let bigsplit = split << bit_count;
 
         let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
             xrange -= bigsplit;
