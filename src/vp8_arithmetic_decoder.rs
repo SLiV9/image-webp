@@ -299,8 +299,7 @@ impl ArithmeticDecoder {
             }
         }
         debug_assert!(self.state.xrange.leading_zeros() <= 56);
-        debug_assert!(self.state.value < (1u64 << 40));
-        debug_assert!(self.state.xrange < (1u64 << 40));
+        debug_assert!(self.state.xrange.leading_zeros() >= 24);
 
         let probability = u64::from(probability);
         let xrange = self.state.xrange;
@@ -458,11 +457,14 @@ impl FastDecoder<'_> {
             value <<= 32;
             value |= u64::from(v);
         }
+        debug_assert!(xrange.leading_zeros() <= 56);
+        debug_assert!(xrange.leading_zeros() >= 24);
 
         let probability = u64::from(probability);
         let bsr = xrange.leading_zeros() as i32 - 32;
         let bit_count = 24 - bsr;
-        let range = (xrange >> bit_count) & 0xFF;
+        let range = xrange >> bit_count;
+        debug_assert!(range <= 0xFF);
         let split = 1 + (((range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << bit_count;
 
