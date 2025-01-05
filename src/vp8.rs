@@ -25,7 +25,6 @@ use super::vp8_arithmetic_decoder::ArithmeticDecoder;
 
 const MAX_SEGMENTS: usize = 4;
 const NUM_DCT_TOKENS: usize = 12;
-const NUM_RESIDUAL_DATA_BLOCKS: usize = 24;
 
 // Prediction modes
 const DC_PRED: i8 = 0;
@@ -1459,13 +1458,7 @@ impl<R: Read> Vp8Decoder<R> {
         self.b.check(res, mb)
     }
 
-    fn intra_predict_luma(
-        &mut self,
-        mbx: usize,
-        mby: usize,
-        mb: &MacroBlock,
-        resdata: &[[[i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS],
-    ) {
+    fn intra_predict_luma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &[i32]) {
         let stride = 1usize + 16 + 4;
         let w = self.frame.width as usize;
         let mw = self.mbwidth as usize;
@@ -1483,7 +1476,8 @@ impl<R: Read> Vp8Decoder<R> {
             for y in 0usize..4 {
                 for x in 0usize..4 {
                     let i = x + y * 4;
-                    let rb: &[[i32; 4]; 4] = &resdata[i];
+                    // Create a reference to a [i32; 16] array for add_residue (slices of size 16 do not work).
+                    let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
                     let y0 = 1 + y * 4;
                     let x0 = 1 + x * 4;
 
@@ -1519,13 +1513,7 @@ impl<R: Read> Vp8Decoder<R> {
         }
     }
 
-    fn intra_predict_chroma(
-        &mut self,
-        mbx: usize,
-        mby: usize,
-        mb: &MacroBlock,
-        resdata: &[[[i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS],
-    ) {
+    fn intra_predict_chroma(&mut self, mbx: usize, mby: usize, mb: &MacroBlock, resdata: &[i32]) {
         let stride = 1usize + 8;
 
         let w = self.frame.chroma_width() as usize;
@@ -1601,13 +1589,13 @@ impl<R: Read> Vp8Decoder<R> {
         for y in 0usize..2 {
             for x in 0usize..2 {
                 let i = x + y * 2;
-                let urb: &[[i32; 4]; 4] = &resdata[16 + i];
+                let urb: &[i32; 16] = resdata[16 * 16 + i * 16..][..16].try_into().unwrap();
 
                 let y0 = 1 + y * 4;
                 let x0 = 1 + x * 4;
                 add_residue(&mut uws, urb, y0, x0, stride);
 
-                let vrb: &[[i32; 4]; 4] = &resdata[20 + i];
+                let vrb: &[i32; 16] = resdata[20 * 16 + i * 16..][..16].try_into().unwrap();
 
                 add_residue(&mut vws, vrb, y0, x0, stride);
             }
@@ -1631,7 +1619,7 @@ impl<R: Read> Vp8Decoder<R> {
 
     fn read_coefficients(
         &mut self,
-        block: &mut [[i32; 4]; 4],
+        block: &mut [i32; 16],
         p: usize,
         plane: usize,
         complexity: usize,
@@ -1659,9 +1647,8 @@ impl<R: Read> Vp8Decoder<R> {
             let token = decoder
                 .read_with_tree_with_first_node(tree, tree[skip as usize])
                 .or_accumulate(&mut res);
-            debug_assert!(token >= 0);
 
-            let mut abs_value: i16 = match token {
+            let mut abs_value = i32::from(match token {
                 DCT_EOB => break,
 
                 DCT_0 => {
@@ -1690,23 +1677,24 @@ impl<R: Read> Vp8Decoder<R> {
                 }
 
                 c => panic!("unknown token: {}", c),
-            };
-            debug_assert!(abs_value >= 0);
+            });
 
             skip = false;
 
-            complexity = (abs_value as u16 as usize).min(2);
+            complexity = if abs_value == 0 {
+                0
+            } else if abs_value == 1 {
+                1
+            } else {
+                2
+            };
 
             if decoder.read_flag().or_accumulate(&mut res) {
                 abs_value = -abs_value;
             }
 
             let zigzag = ZIGZAG[i] as usize;
-            let r = zigzag / 4;
-            let c = zigzag % 4;
-            let cq: i16 = if zigzag > 0 { acq } else { dcq };
-            let value = abs_value * cq;
-            block[r][c] = i32::from(value);
+            block[zigzag] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
 
             has_coefficients = true;
         }
@@ -1719,15 +1707,14 @@ impl<R: Read> Vp8Decoder<R> {
         mb: &MacroBlock,
         mbx: usize,
         p: usize,
-        blocks: &mut [[[i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS],
-    ) -> Result<(), DecodingError> {
+    ) -> Result<[i32; 384], DecodingError> {
         let sindex = mb.segmentid as usize;
+        let mut blocks = [0i32; 384];
         let mut plane = if mb.luma_mode == LumaMode::B { 3 } else { 1 };
-        let mut ns = [false; NUM_RESIDUAL_DATA_BLOCKS];
 
         if plane == 1 {
             let complexity = self.top[mbx].complexity[0] + self.left.complexity[0];
-            let mut block = [[0i32; 4]; 4];
+            let mut block = [0i32; 16];
             let dcq = self.segment[sindex].y2dc;
             let acq = self.segment[sindex].y2ac;
             let n = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
@@ -1737,11 +1724,8 @@ impl<R: Read> Vp8Decoder<R> {
 
             transform::iwht4x4(&mut block);
 
-            for y in 0..4 {
-                for x in 0..4 {
-                    let k = y * 4 + x;
-                    blocks[k][0][0] = block[y][x];
-                }
+            for k in 0usize..16 {
+                blocks[16 * k] = block[k];
             }
 
             plane = 0;
@@ -1751,7 +1735,8 @@ impl<R: Read> Vp8Decoder<R> {
             let mut left = self.left.complexity[y + 1];
             for x in 0usize..4 {
                 let i = x + y * 4;
-                let block: &mut [[i32; 4]; 4] = &mut blocks[i];
+                let block = &mut blocks[i * 16..][..16];
+                let block: &mut [i32; 16] = block.try_into().unwrap();
 
                 let complexity = self.top[mbx].complexity[x + 1] + left;
                 let dcq = self.segment[sindex].ydc;
@@ -1759,7 +1744,9 @@ impl<R: Read> Vp8Decoder<R> {
 
                 let n = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
 
-                ns[i] = n | (block[0][0] != 0);
+                if block[0] != 0 || n {
+                    transform::idct4x4(block);
+                }
 
                 left = if n { 1 } else { 0 };
                 self.top[mbx].complexity[x + 1] = if n { 1 } else { 0 };
@@ -1776,7 +1763,8 @@ impl<R: Read> Vp8Decoder<R> {
 
                 for x in 0usize..2 {
                     let i = x + y * 2 + if j == 5 { 16 } else { 20 };
-                    let block: &mut [[i32; 4]; 4] = &mut blocks[i];
+                    let block = &mut blocks[i * 16..][..16];
+                    let block: &mut [i32; 16] = block.try_into().unwrap();
 
                     let complexity = self.top[mbx].complexity[x + j] + left;
                     let dcq = self.segment[sindex].uvdc;
@@ -1784,8 +1772,9 @@ impl<R: Read> Vp8Decoder<R> {
 
                     let n =
                         self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
-
-                    ns[i] = n | (block[0][0] != 0);
+                    if block[0] != 0 || n {
+                        transform::idct4x4(block);
+                    }
 
                     left = if n { 1 } else { 0 };
                     self.top[mbx].complexity[x + j] = if n { 1 } else { 0 };
@@ -1795,9 +1784,7 @@ impl<R: Read> Vp8Decoder<R> {
             }
         }
 
-        transform_residual_data_blocks(blocks, &ns);
-
-        Ok(())
+        Ok(blocks)
     }
 
     /// Does loop filtering on the macroblock
@@ -2139,9 +2126,8 @@ impl<R: Read> Vp8Decoder<R> {
 
             for mbx in 0..self.mbwidth as usize {
                 let mb = self.read_macroblock_header(mbx)?;
-                let mut blocks = [[[0i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS];
-                if !mb.coeffs_skipped {
-                    self.read_residual_data(&mb, mbx, p, &mut blocks)?;
+                let blocks = if !mb.coeffs_skipped {
+                    self.read_residual_data(&mb, mbx, p)?
                 } else {
                     if mb.luma_mode != LumaMode::B {
                         self.left.complexity[0] = 0;
@@ -2152,7 +2138,9 @@ impl<R: Read> Vp8Decoder<R> {
                         self.left.complexity[i] = 0;
                         self.top[mbx].complexity[i] = 0;
                     }
-                }
+
+                    [0i32; 384]
+                };
 
                 self.intra_predict_luma(mbx, mby, &mb, &blocks);
                 self.intra_predict_chroma(mbx, mby, &mb, &blocks);
@@ -2308,11 +2296,14 @@ fn avg2(this: u8, right: u8) -> u8 {
     avg as u8
 }
 
+// Only 16 elements from rblock are used to add residue, so it is restricted to 16 elements
+// to enable SIMD and other optimizations.
+//
 // Clippy suggests the clamp method, but it seems to optimize worse as of rustc 1.82.0 nightly.
 #[allow(clippy::manual_clamp)]
-fn add_residue(pblock: &mut [u8], rblock: &[[i32; 4]; 4], y0: usize, x0: usize, stride: usize) {
+fn add_residue(pblock: &mut [u8], rblock: &[i32; 16], y0: usize, x0: usize, stride: usize) {
     let mut pos = y0 * stride + x0;
-    for row in rblock {
+    for row in rblock.chunks(4) {
         for (p, &a) in pblock[pos..][..4].iter_mut().zip(row.iter()) {
             *p = (a + i32::from(*p)).max(0).min(255) as u8;
         }
@@ -2320,26 +2311,7 @@ fn add_residue(pblock: &mut [u8], rblock: &[[i32; 4]; 4], y0: usize, x0: usize, 
     }
 }
 
-#[inline(never)]
-fn transform_residual_data_blocks(
-    blocks: &mut [[[i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS],
-    ns: &[bool; NUM_RESIDUAL_DATA_BLOCKS],
-) {
-    for i in 0..NUM_RESIDUAL_DATA_BLOCKS {
-        let block = &mut blocks[i];
-        let n = ns[i];
-        if n {
-            transform::idct4x4(block);
-        }
-    }
-}
-
-fn predict_4x4(
-    ws: &mut [u8],
-    stride: usize,
-    modes: &[IntraMode],
-    resdata: &[[[i32; 4]; 4]; NUM_RESIDUAL_DATA_BLOCKS],
-) {
+fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32]) {
     for sby in 0usize..4 {
         for sbx in 0usize..4 {
             let i = sbx + sby * 4;
@@ -2359,7 +2331,7 @@ fn predict_4x4(
                 IntraMode::HU => predict_bhupred(ws, x0, y0, stride),
             }
 
-            let rb: &[[i32; 4]; 4] = &resdata[i];
+            let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
             add_residue(ws, rb, y0, x0, stride);
         }
     }
@@ -2889,10 +2861,7 @@ mod tests {
     fn test_add_residue() {
         let mut pblock = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let rblock = [
-            [-1, -2, -3, -4],
-            [250, 249, 248, 250],
-            [-10, -18, -192, -17],
-            [-3, 15, 18, 9],
+            -1, -2, -3, -4, 250, 249, 248, 250, -10, -18, -192, -17, -3, 15, 18, 9,
         ];
         let expected: [u8; 16] = [0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 10, 29, 33, 25];
 
