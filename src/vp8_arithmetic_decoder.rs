@@ -487,7 +487,49 @@ impl FastDecoder<'_> {
     }
 
     fn fast_read_flag(&mut self) -> bool {
-        self.fast_read_bit(128)
+        let State {
+            mut chunk_index,
+            mut value,
+            mut xrange,
+        } = self.uncommitted_state;
+
+        if xrange.leading_zeros() > 56 {
+            let chunk = self.chunks.get(chunk_index).copied();
+            // We ignore invalid data inside the `fast_` functions,
+            // but we increase `chunk_index` below, so we can check
+            // whether we read invalid data in `commit_if_valid`.
+            let chunk = chunk.unwrap_or_default();
+
+            let v = u32::from_be_bytes(chunk);
+            chunk_index += 1;
+            xrange <<= 32;
+            value <<= 32;
+            value |= u64::from(v);
+        }
+        debug_assert!(xrange.leading_zeros() <= 56);
+        debug_assert!(xrange.leading_zeros() >= 24);
+
+        let bsr = xrange.leading_zeros();
+        let bit_count = 56 - bsr;
+        let half_range = xrange >> (bit_count + 1);
+        let half_xrange = half_range << bit_count;
+        let bigsplit = xrange - half_xrange;
+
+        let retval = if let Some(new_value) = value.checked_sub(bigsplit) {
+            xrange = half_xrange;
+            value = new_value;
+            true
+        } else {
+            xrange = bigsplit;
+            false
+        };
+
+        self.uncommitted_state = State {
+            chunk_index,
+            value,
+            xrange,
+        };
+        retval
     }
 
     fn fast_read_literal(&mut self, n: u8) -> u8 {
