@@ -612,6 +612,10 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
             return Err(DecodingError::ImageTooLarge);
         }
 
+        // Warm up the allocator??
+        let b = vec![0u8; buf.len()];
+        std::mem::drop(std::hint::black_box(b));
+
         if self.is_animated() {
             let saved = std::mem::take(&mut self.animation);
             self.animation.next_frame_start =
