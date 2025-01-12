@@ -1143,7 +1143,8 @@ impl<R: Read> Vp8Decoder<R> {
             }
         }
 
-        let mut buf = Vec::new();
+        let mut buf =
+            Vec::with_capacity((self.frame.width as usize) * (self.frame.height as usize));
         self.r.read_to_end(&mut buf)?;
         let size = buf.len();
         let mut chunks = vec![[0; 4]; (size + 3) / 4];
